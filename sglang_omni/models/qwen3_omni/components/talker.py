@@ -5,13 +5,13 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import add_prefix, is_cpu
 from torch import nn
 
 from sglang_omni.models.qwen3_omni.components.thinker_model import (
@@ -358,7 +358,7 @@ class Qwen3OmniMoeTalkerDecoderLayer(Qwen3OmniMoeThinkerTextDecoderLayer):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         # Call parent's __init__ (Thinker's DecoderLayer)
         super().__init__(
@@ -458,7 +458,7 @@ class Qwen3OmniMoeTalkerTextModel(nn.Module):
         )
 
         # Decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.get_device_module().Stream() if not is_cpu() else None
         self.layers = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Qwen3OmniMoeTalkerDecoderLayer(
@@ -589,7 +589,7 @@ class Qwen3OmniMoeTalkerCodePredictor(nn.Module):
         )
 
         # 5 dense decoder layers
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.get_device_module().Stream() if not is_cpu() else None
         self.model.layers = nn.ModuleList()
         for idx in range(cp_config.num_hidden_layers):
             # Create a decoder layer similar to Thinker but with dense MLP
@@ -1394,7 +1394,7 @@ class Qwen3OmniTalker(nn.Module):
             custom_params=None,
             custom_logit_processor=None,
             sampling_seed=self._sampling_seeds[:batch_size],
-            device="cuda",
+            device=self._sampling_seeds.device.type,
             logit_bias=None,
         )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Annotated, Literal, NoReturn
 
 import typer
@@ -928,6 +929,17 @@ def serve(
             help="Run Qwen speech with GPU stages colocated on one GPU.",
         ),
     ] = False,
+    device: Annotated[
+        str | None,
+        typer.Option(
+            "--device",
+            help=(
+                "Accelerator backend: 'cuda' or 'xpu'. Pins the platform so stage "
+                "device strings (e.g. 'cuda:0') resolve to it. Omit to auto-detect "
+                "(cuda -> xpu)."
+            ),
+        ),
+    ] = None,
     isolate_stage: Annotated[
         list[str] | None,
         typer.Option(
@@ -1251,6 +1263,21 @@ def serve(
         level=getattr(logging, log_level.upper()),
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+
+    # Pin the platform before anything resolves a device, so stage device
+    # strings (e.g. "cuda:0") bind to the requested backend. OmniPlatform.detect()
+    # reads this and fails loudly when the backend is unavailable.
+    if device is not None:
+        requested = device.strip().lower()
+        if requested not in {"cuda", "xpu"}:
+            raise typer.BadParameter("--device must be one of: cuda, xpu")
+        os.environ["SGLANG_OMNI_DEVICE"] = requested
+        from sglang_omni.platforms import OmniPlatform
+
+        try:
+            OmniPlatform.detect()
+        except RuntimeError as exc:
+            raise typer.BadParameter(str(exc)) from exc
 
     _validate_colocate_cli_request(
         colocate=colocate,

@@ -46,9 +46,11 @@ def set_random_seed(seed: int) -> None:
 def avail_gpu_mem(gpu_id: int) -> float | None:
     """Return currently free GPU memory in GiB, or None when unavailable."""
     try:
-        if not torch.cuda.is_available():
-            return None
-        free_bytes, _ = torch.cuda.mem_get_info(gpu_id)
+        # Via the platform, so non-CUDA accelerators report a real figure
+        # instead of None in the startup memory diagnostics.
+        from sglang_omni.platforms import resolve_current_platform
+
+        free_bytes, _ = resolve_current_platform().get_available_memory(gpu_id)
         return free_bytes / (1024**3)
     except Exception:
         return None

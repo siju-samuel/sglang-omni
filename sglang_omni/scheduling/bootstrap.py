@@ -138,6 +138,19 @@ def create_sglang_infrastructure(
     )
 
 
+class _DeferredCudaGraph(int):
+    """Truthy ``disable_cuda_graph`` marker distinguishable from a plain ``True``.
+
+    Subclasses ``int`` so ``bool()`` and ``asdict``/json of ServerArgs still work,
+    while identity tells our own deferral from a force-off applied mid-build.
+    """
+
+    __slots__ = ()
+
+
+_DEFERRED_CUDA_GRAPH = _DeferredCudaGraph(1)
+
+
 # note (luojiaxuan): Some Omni generation stages cannot let the generic SGLang
 # worker capture CUDA graphs immediately during infrastructure construction. At
 # that point the shared request pools exist, but stage-owned decode state may not:
@@ -168,12 +181,13 @@ def create_sglang_infrastructure_defer_cuda_graph(
     The caller finishes stage-specific decode setup, then runs
     init_cuda_graphs() only when this returns that CUDA graphs were requested.
     """
-    want_cuda_graph = not bool(server_args.disable_cuda_graph)
+    want_cuda_graph = deferred = not bool(server_args.disable_cuda_graph)
     if want_cuda_graph:
+        # The device policy below sets this same flag, so mark ours apart.
         override_server_args(
             server_args,
             "sglang_omni.defer_cuda_graph_capture",
-            disable_cuda_graph=True,
+            disable_cuda_graph=_DEFERRED_CUDA_GRAPH,
         )
     try:
         infrastructure = create_sglang_infrastructure(
@@ -185,9 +199,19 @@ def create_sglang_infrastructure_defer_cuda_graph(
         )
     finally:
         if want_cuda_graph:
-            override_server_args(
-                server_args,
-                "sglang_omni.restore_cuda_graph_capture",
-                disable_cuda_graph=False,
-            )
+            # A plain True means the build's device policy force-disabled capture
+            # (e.g. XPU has no CUDA runtime); honor that over the pre-build intent.
+            if server_args.disable_cuda_graph is not _DEFERRED_CUDA_GRAPH:
+                want_cuda_graph = False
+            else:
+                override_server_args(
+                    server_args,
+                    "sglang_omni.restore_cuda_graph_capture",
+                    disable_cuda_graph=False,
+                )
+    if deferred and not want_cuda_graph:
+        # The deferral skipped init_cuda_graphs() expecting the caller to run it;
+        # with capture off nobody will, and forward() reads the eager runner it
+        # installs unconditionally. Capture stays off via the argument.
+        infrastructure[0].model_runner.init_cuda_graphs(capture_decode_cuda_graph=False)
     return want_cuda_graph, infrastructure

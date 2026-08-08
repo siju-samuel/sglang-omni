@@ -18,6 +18,7 @@ class PlatformEnum(str, enum.Enum):
     """Known platform types, following SGLang's platform convention."""
 
     CUDA = "cuda"
+    XPU = "xpu"
     CPU = "cpu"
     UNSPECIFIED = "unspecified"
 
@@ -41,6 +42,7 @@ class ResolvedPlatformSpec:
         )
         supported = {
             (PlatformEnum.CUDA, "cuda", "nccl"),
+            (PlatformEnum.XPU, "xpu", "xccl"),
             (PlatformEnum.CPU, "cpu", "gloo"),
         }
         if actual not in supported:
@@ -60,6 +62,9 @@ class DeviceMixin:
     def is_cpu(self) -> bool:
         return self._enum is PlatformEnum.CPU
 
+    def is_xpu(self) -> bool:
+        return self._enum is PlatformEnum.XPU
+
     def get_device(self, device_id: int = 0) -> torch.device:
         return torch.device(self.device_type, device_id)
 
@@ -71,6 +76,14 @@ class DeviceMixin:
 
     def get_device_properties(self, device_id: int = 0) -> Any:
         raise NotImplementedError
+
+    def get_device_capability(self, device_id: int = 0) -> str | None:
+        """Compute capability, or None where the platform has no notion of one.
+
+        Mirrors SGLang's own DeviceMixin service: callers ask the platform rather
+        than reading vendor-specific fields off ``get_device_properties()``.
+        """
+        return None
 
     def empty_cache(self) -> None:
         pass
@@ -90,19 +103,48 @@ class OmniPlatform(DeviceMixin):
 
     @staticmethod
     def detect(torch_module: Any = torch) -> "OmniPlatform":
-        from sglang_omni.platforms.cuda_platform import CudaOmniPlatform
+        """Resolve the platform: the ``--device`` pin if set, else probe order.
 
-        runtime = getattr(torch_module, "cuda", None)
-        if runtime is not None and runtime.is_available():
-            return CudaOmniPlatform()
+        The pin wins so a host exposing two accelerators serves the requested one,
+        and an unavailable pin raises rather than silently falling back.
+        """
+        import os
+
+        from sglang_omni.platforms.cuda_platform import CudaOmniPlatform
+        from sglang_omni.platforms.xpu_platform import XpuOmniPlatform
+
+        accelerators = {"cuda": CudaOmniPlatform, "xpu": XpuOmniPlatform}
+
+        def available(name: str) -> bool:
+            runtime = getattr(torch_module, name, None)
+            return runtime is not None and runtime.is_available()
+
+        pinned = (os.environ.get("SGLANG_OMNI_DEVICE") or "").strip().lower()
+        if pinned == "cpu":
+            return CpuOmniPlatform()
+        if pinned:
+            if pinned not in accelerators:
+                raise RuntimeError(f"unknown device {pinned!r}: expected cuda or xpu")
+            if not available(pinned):
+                raise RuntimeError(
+                    f"device {pinned!r} was requested but is unavailable here; check "
+                    "the driver and torch build (a +xpu build has no CUDA runtime)"
+                )
+            return accelerators[pinned]()
+        for name, cls in accelerators.items():
+            if available(name):
+                return cls()
         return CpuOmniPlatform()
 
     @staticmethod
     def from_spec(spec: ResolvedPlatformSpec) -> "OmniPlatform":
         from sglang_omni.platforms.cuda_platform import CudaOmniPlatform
+        from sglang_omni.platforms.xpu_platform import XpuOmniPlatform
 
         if spec.platform_type is PlatformEnum.CUDA:
             return CudaOmniPlatform()
+        if spec.platform_type is PlatformEnum.XPU:
+            return XpuOmniPlatform()
         if spec.platform_type is PlatformEnum.CPU:
             return CpuOmniPlatform()
         raise ValueError(f"Unsupported platform type {spec.platform_type!r}")
@@ -164,14 +206,17 @@ class OmniPlatform(DeviceMixin):
         ``{"CUDA_VISIBLE_DEVICES": "3"}``. Without an existing visibility
         mask, the logical ID is used as the physical selector.
 
+        A platform with no ``device_control_env_var`` returns ``{}``: its ranks
+        address devices by id, so callers must treat an empty mapping as "no
+        visibility override" rather than an error.
+
         Raises:
-            RuntimeError: If the platform has no device-control variable.
             ValueError: If the device ID is negative or outside the current
                 visibility mask.
         """
         env_var = self.device_control_env_var
         if env_var is None:
-            raise RuntimeError("Accelerator worker requires a device control variable")
+            return {}
         if logical_device_id < 0:
             raise ValueError(f"Invalid device id {logical_device_id}")
         visible_devices = self.visible_devices(env)
@@ -185,6 +230,20 @@ class OmniPlatform(DeviceMixin):
         else:
             selector = logical_device_id
         return {env_var: str(selector)}
+
+    def inherited_visibility_count(self, env: Mapping[str, str]) -> int | None:
+        """How many devices an inherited mask exposes, or None if unmasked."""
+        return None
+
+    def clear_inherited_visibility(
+        self, env: MutableMapping[str, str], *, log: Any = None
+    ) -> str | None:
+        """Drop an inherited visibility mask, returning what was removed.
+
+        Only for platforms whose ranks address devices by id: an inherited subset
+        would leave later ranks indexing devices the process cannot see.
+        """
+        return None
 
     def initialize_worker(self) -> None:
         # TODO: not used right now. Refactor into this method for device initialization

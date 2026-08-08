@@ -49,8 +49,8 @@ class _Runtime:
         return (512, 1024)
 
 
-def _torch_runtime(cuda: _Runtime | None = None):
-    return SimpleNamespace(cuda=cuda)
+def _torch_runtime(cuda: _Runtime | None = None, xpu: _Runtime | None = None):
+    return SimpleNamespace(cuda=cuda, xpu=xpu)
 
 
 def test_cuda_is_resolved_from_an_available_cuda_runtime() -> None:
@@ -153,3 +153,142 @@ def test_reclaim_propagates_cleanup_failures_by_default(monkeypatch) -> None:
     platform = resolve_current_platform(_torch_runtime(runtime))
     with pytest.raises(RuntimeError, match="synchronize failed"):
         platform.reclaim_process_memory(platform.get_device())
+
+
+def test_xpu_is_resolved_when_only_an_xpu_runtime_is_available() -> None:
+    platform = resolve_current_platform(_torch_runtime(_Runtime(False), _Runtime()))
+
+    assert platform._enum is PlatformEnum.XPU
+    assert not platform.is_cuda()
+    assert platform.device_type == "xpu"
+    assert platform.distributed_backend == "xccl"
+    # cuda_ipc is CUDA-only, so cross-stage payloads stage through host memory.
+    assert platform.transfer_policy() is TransferPolicy.HOST_STAGED
+    assert not platform.support_same_device_weight_sharing()
+    assert not platform.support_cross_node_transport()
+
+
+def test_cuda_wins_when_both_runtimes_are_available() -> None:
+    platform = resolve_current_platform(_torch_runtime(_Runtime(), _Runtime()))
+
+    assert platform.is_cuda()
+
+
+def test_xpu_platform_spec_round_trip() -> None:
+    platform = resolve_current_platform(_torch_runtime(_Runtime(False), _Runtime()))
+    spec = pickle.loads(pickle.dumps(platform.to_spec()))
+    restored = OmniPlatform.from_spec(spec)
+
+    assert spec == ResolvedPlatformSpec(PlatformEnum.XPU, "xpu", "xccl")
+    assert restored._enum is PlatformEnum.XPU
+
+
+def test_xpu_emits_no_worker_visibility_override() -> None:
+    """ZE_AFFINITY_MASK *would* isolate a rank to one card, but that hides its
+    peers and hangs XCCL discovery -- the opposite of CUDA_VISIBLE_DEVICES with
+    NCCL. So XPU declares no device-control variable and every rank keeps the
+    full device list, addressing its own by id."""
+    platform = resolve_current_platform(_torch_runtime(_Runtime(False), _Runtime()))
+
+    assert platform.device_control_env_var is None
+    assert platform.visible_devices({"ZE_AFFINITY_MASK": "1,2"}) == []
+    # An empty mapping means "no visibility override", not an error.
+    assert platform.worker_device_env(3, {}) == {}
+    assert platform.worker_device_env(3, {"ZE_AFFINITY_MASK": "1,2"}) == {}
+
+
+def test_xpu_clears_an_inherited_visibility_mask() -> None:
+    """A partial mask inherited from the launching shell truncates the device
+    list, so ranks beyond it index devices the process cannot see."""
+    platform = resolve_current_platform(_torch_runtime(_Runtime(False), _Runtime()))
+    env = {"ZE_AFFINITY_MASK": "1,2,4,5,6,7", "KEEP": "me"}
+
+    removed = platform.clear_inherited_visibility(env)
+
+    assert removed == "1,2,4,5,6,7"
+    assert env == {"KEEP": "me"}
+
+
+def test_platforms_that_isolate_by_visibility_clear_nothing() -> None:
+    platform = resolve_current_platform(_torch_runtime(_Runtime()))
+    env = {"CUDA_VISIBLE_DEVICES": "3"}
+
+    assert platform.clear_inherited_visibility(env) is None
+    assert env == {"CUDA_VISIBLE_DEVICES": "3"}
+
+
+_GIB = 1 << 30
+
+
+@pytest.mark.parametrize(
+    ("driver_free", "reserved", "expected"),
+    [
+        # Driver claims everything is free while 10 GiB is reserved: the floor
+        # must win, and it is stricter than SGLang's total-memory_allocated.
+        pytest.param(24, 10, 14, id="floored_when_driver_over_reports"),
+        # An honest driver report is already stricter, so keep it.
+        pytest.param(3, 1, 3, id="honest_driver_report_is_kept"),
+    ],
+)
+def test_xpu_available_memory_takes_the_stricter_bound(
+    monkeypatch, driver_free: int, reserved: int, expected: int
+) -> None:
+    import sglang_omni.platforms.xpu_platform as xpu_platform_module
+
+    platform = OmniPlatform.from_spec(
+        ResolvedPlatformSpec(PlatformEnum.XPU, "xpu", "xccl")
+    )
+    monkeypatch.setattr(
+        xpu_platform_module.torch,
+        "xpu",
+        SimpleNamespace(
+            mem_get_info=lambda device_id=0: (driver_free * _GIB, 24 * _GIB),
+            memory_reserved=lambda device_id=0: reserved * _GIB,
+        ),
+        raising=False,
+    )
+
+    free, total = platform.get_available_memory(0)
+
+    assert (free, total) == (expected * _GIB, 24 * _GIB)
+
+
+def test_gpu_device_metadata_comes_from_the_resolved_platform(monkeypatch) -> None:
+    """Total memory must resolve on any accelerator, not just CUDA.
+
+    Guards a regression where the PyTorch fallback probed torch.cuda directly and
+    returned None off CUDA, which made the colocated KV-cache profiler raise.
+    """
+    from sglang_omni.utils import gpu_memory
+
+    backend = SimpleNamespace(
+        is_available=lambda: True,
+        get_device_properties=lambda device_id: SimpleNamespace(
+            name="Accelerator-0", total_memory=24 << 30
+        ),
+    )
+    monkeypatch.setattr(gpu_memory, "_accelerator_device_type", lambda: "zzdev")
+    monkeypatch.setattr(
+        gpu_memory.importlib,
+        "import_module",
+        lambda name: SimpleNamespace(zzdev=backend),
+    )
+
+    info = gpu_memory._get_torch_gpu_device_info(0, 0)
+
+    assert (info.name, info.total_memory_bytes) == ("Accelerator-0", 24 << 30)
+
+
+def test_gpu_device_metadata_degrades_to_none_without_an_accelerator(
+    monkeypatch,
+) -> None:
+    from sglang_omni.utils import gpu_memory
+
+    monkeypatch.setattr(gpu_memory, "_accelerator_device_type", lambda: "zzdev")
+    monkeypatch.setattr(
+        gpu_memory.importlib, "import_module", lambda name: SimpleNamespace()
+    )
+
+    info = gpu_memory._get_torch_gpu_device_info(0, 0)
+
+    assert (info.name, info.total_memory_bytes) == (None, None)

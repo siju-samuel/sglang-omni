@@ -296,9 +296,12 @@ def _logical_devices(
                 "physical GPU mapping and free memory are unsupported."
             )
         architecture = None
-        torch_cc = (
-            f"{properties.major}.{properties.minor}" if properties is not None else None
-        )
+        # Ask the platform: major/minor exist only on CUDA properties, so reading
+        # them here would crash on any other accelerator.
+        try:
+            torch_cc = platform.get_device_capability(logical_index)
+        except Exception:  # noqa: BLE001 - diagnostics must not die on a field
+            torch_cc = None
         architecture = (
             getattr(properties, "gcnArchName", None) if properties is not None else None
         )

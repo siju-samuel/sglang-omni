@@ -28,14 +28,19 @@ from sglang_omni.scheduling.types import (
     SchedulerOutput,
 )
 from tests.unit_test.fakes import FakeExecutionBridge
+from tests.unit_test.fixtures.platform import ACCELERATOR
+
+# The event patch derives its module from this same value, so they cannot drift.
+_STUB_DEVICE = torch.device("cpu")
 
 
 class _StubRunner(ModelRunner):
     """ModelRunner with mocked sub-steps; exercises only execute_launch/resolve."""
 
     def __init__(self):
+        self.device = _STUB_DEVICE  # real runners set this in __init__
         self._async_enabled = True
-        self._execution_bridge = FakeExecutionBridge()
+        self._execution_bridge = FakeExecutionBridge(_STUB_DEVICE)
         self._staging_slot = 0
         self._host_staging_buffers = []
         self._async_query_hit = 0
@@ -106,7 +111,38 @@ def _patch_event(ready: bool):
         def synchronize(self):
             self.synced = True
 
-    return mock.patch("torch.cuda.Event", _FakeEvent)
+    # The bridge builds it via get_device_module(device).Event(): patch there.
+    return mock.patch.object(torch.get_device_module(_STUB_DEVICE), "Event", _FakeEvent)
+
+
+def test_launch_event_comes_from_the_runners_device_module():
+    """execute_launch must build the event on the runner's own device backend.
+
+    Guards a regression to a hardcoded torch.cuda.Event / torch.cpu.Event. The
+    device is the live backend, not a literal: an uncompiled backend's Event can
+    be referenced but not instantiated, so a literal would fail other builds' CI.
+    """
+    from sglang_omni.platforms import resolve_current_platform
+
+    accel = torch.device(resolve_current_platform().device_type)
+    runner = _StubRunner()
+    runner.device = accel
+    runner._execution_bridge = FakeExecutionBridge(accel)
+
+    seen = []
+    real_event = torch.get_device_module(accel).Event
+
+    class _RecordingEvent(real_event):  # type: ignore[misc,valid-type]
+        def __new__(cls, *a, **k):
+            seen.append(cls)
+            return super().__new__(cls)
+
+    with mock.patch.object(torch.get_device_module(accel), "Event", _RecordingEvent):
+        pending = runner.execute_launch(_sched_output(1))
+
+    assert seen, "no event built from the runner's device module"
+    assert pending is not None
+    assert isinstance(pending.event, real_event)
 
 
 def _sched_output(n):
@@ -352,7 +388,7 @@ def test_finalize_unions_finalize_skip_rids_hook():
     assert chunk_data.generation_steps == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned memory requires CUDA")
+@pytest.mark.skipif(ACCELERATOR is None, reason="pinned memory needs an accelerator")
 def test_host_staging_pingpong():
     r = _StubRunner()
     b0 = r._next_host_staging((8, 18), torch.float32)
@@ -363,7 +399,7 @@ def test_host_staging_pingpong():
     assert b0.is_pinned() and tuple(b0.shape) == (8, 18) and b0.dtype == torch.float32
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned memory requires CUDA")
+@pytest.mark.skipif(ACCELERATOR is None, reason="pinned memory needs an accelerator")
 def test_default_launch_resolve_pinned_snapshot_pingpong():
     """Base (plain-LM) launch/resolve: launch snapshots the sampled ids into a
     pinned buffer, resolve points ``result.next_token_ids`` at that snapshot,
@@ -378,14 +414,16 @@ def test_default_launch_resolve_pinned_snapshot_pingpong():
 
     def _result(vals):
         return types.SimpleNamespace(
-            next_token_ids=torch.tensor(vals, device="cuda"), logits_output=None
+            next_token_ids=torch.tensor(vals, device=ACCELERATOR), logits_output=None
         )
 
     r1, r2 = _result([11, 12]), _result([21, 22])
     buf1 = r.post_decode_launch(r1, None, reqs)
     buf2 = r.post_decode_launch(r2, None, reqs)
     assert buf1 is not buf2
-    torch.cuda.synchronize()  # stands in for the recorded launch event wait
+    torch.get_device_module(
+        ACCELERATOR
+    ).synchronize()  # stands in for the recorded launch event wait
     r.post_decode_resolve(buf1, r1, None, None, reqs)
     r.post_decode_resolve(buf2, r2, None, None, reqs)
     assert r1.next_token_ids.tolist() == [11, 12]
@@ -397,21 +435,22 @@ def test_default_launch_resolve_pinned_snapshot_pingpong():
     assert buf3 is buf1
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="pinned memory requires CUDA")
+@pytest.mark.skipif(ACCELERATOR is None, reason="pinned memory needs an accelerator")
 def test_default_launch_staging_grows_then_slices_to_smaller_batch():
     r = ModelRunner.__new__(ModelRunner)
     r._staging_slot = 0
     r._host_staging_buffers = []
     big = types.SimpleNamespace(
-        next_token_ids=torch.tensor([1, 2, 3, 4], device="cuda"), logits_output=None
+        next_token_ids=torch.tensor([1, 2, 3, 4], device=ACCELERATOR),
+        logits_output=None,
     )
     r.post_decode_launch(big, None, [object()] * 4)
     small = types.SimpleNamespace(
-        next_token_ids=torch.tensor([7, 8], device="cuda"), logits_output=None
+        next_token_ids=torch.tensor([7, 8], device=ACCELERATOR), logits_output=None
     )
     buf_small = r.post_decode_launch(small, None, [object()] * 2)
     assert buf_small.numel() == 4  # capacity retained; no realloc on shrink
-    torch.cuda.synchronize()
+    torch.get_device_module(ACCELERATOR).synchronize()
     r.post_decode_resolve(buf_small, small, None, None, [object()] * 2)
     assert small.next_token_ids.tolist() == [7, 8]
 

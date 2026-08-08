@@ -21,6 +21,11 @@ from sglang_omni.models.qwen3_omni.components.code2wav_cuda_graph import (
     Code2WavRunResult,
     GraphKey,
 )
+from sglang_omni.platforms import (
+    OmniPlatform,
+    ResolvedPlatformSpec,
+    resolve_current_platform,
+)
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.profiler.event_recorder import get_recorder as _get_event_recorder
 from sglang_omni.profiler.event_recorder import get_recorder as _get_recorder
@@ -267,8 +272,10 @@ class Code2WavScheduler(StreamingVocoderBase[Code2WavStreamState, "list[int]"]):
         graph_eligible: bool = False,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         with torch.no_grad():
-            if self._device.type == "cuda":
-                torch.cuda.set_device(self._device)
+            if self._device.type != "cpu":
+                torch.get_device_module(self._device).set_device(
+                    self._device.index or 0
+                )
             if self._cuda_graph_runner is None:
                 result = Code2WavRunResult(
                     output=self._model(codes),
@@ -525,6 +532,7 @@ def create_code2wav_scheduler(
     batch_ceiling: int = 8,
     enable_cuda_graph: bool = False,
     total_gpu_memory_fraction: float | None = None,
+    platform_spec: "ResolvedPlatformSpec | None" = None,
 ):
     """Factory: returns Code2WavScheduler."""
     if enable_batching and enable_cuda_graph:
@@ -534,12 +542,32 @@ def create_code2wav_scheduler(
             "Code2Wav CUDA graph requires "
             "runtime.resources.total_gpu_memory_fraction"
         )
+    platform = (
+        OmniPlatform.from_spec(platform_spec)
+        if platform_spec is not None
+        else resolve_current_platform()
+    )
     if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
-    concrete_device = torch.device(device)
-    if concrete_device.type == "cuda" and concrete_device.index is None:
-        concrete_device = torch.device("cuda", torch.cuda.current_device())
+        concrete_device = platform.get_device(int(gpu_id))
+    else:
+        # config.py passes a literal "cuda": retarget it, keeping any explicit index.
+        requested = torch.device(device)
+        if requested.type == "cpu":
+            concrete_device = requested
+        elif requested.index is not None:
+            concrete_device = platform.get_device(requested.index)
+        else:
+            backend = getattr(torch, platform.device_type, None)
+            index = int(backend.current_device()) if backend is not None else 0
+            concrete_device = platform.get_device(index)
     device = str(concrete_device)
+    if enable_cuda_graph and concrete_device.type != "cuda":
+        # Code2WavCudaGraphRunner is CUDA-only (torch.cuda mem_get_info/Stream).
+        logger.info(
+            "Code2Wav CUDA graph disabled on %s (CUDA-only runner); running eager",
+            concrete_device.type,
+        )
+        enable_cuda_graph = False
     stream_chunk_size = max(int(stream_chunk_size), 1)
     left_context_size = max(int(left_context_size), 0)
     model = load_code2wav_model(model_path, device=device, dtype=dtype)

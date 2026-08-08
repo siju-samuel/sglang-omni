@@ -79,8 +79,7 @@ class _OmniKVCacheConfigurator(KVCacheConfigurator):
         if total_memory is None:
             raise RuntimeError(
                 "Colocated SGLang AR stage requires total GPU memory for "
-                f"gpu_id={self.gpu_id}. Check CUDA_VISIBLE_DEVICES and CUDA "
-                "device visibility."
+                f"gpu_id={self.gpu_id}. Check device visibility."
             )
 
         if process_memory is None or process_memory <= 0:

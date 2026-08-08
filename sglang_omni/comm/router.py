@@ -45,6 +45,7 @@ class CommRouter:
         self.remote_stage_names = set(remote_stage_names or ())
         self.platform_spec = platform_spec
         platform = OmniPlatform.from_spec(platform_spec)
+        self._platform = platform
         self._transfer_policy = platform.transfer_policy()
         if self.remote_stage_names and not platform.support_cross_node_transport():
             raise RuntimeError(
@@ -160,13 +161,16 @@ class CommRouter:
         devices = _tensor_devices(getattr(payload, "data", payload))
         if not devices or devices == {"cpu"}:
             return TransportKind.SHM
-        if "cuda" in devices and devices <= {"cpu", "cuda"}:
+        accelerator = self._platform.device_type
+        if accelerator in devices and devices <= {"cpu", accelerator}:
             if (
                 self._transfer_policy is TransferPolicy.CUDA_IPC
                 and self.self_is_gpu
                 and target in self.gpu_stage_names
             ):
                 return TransportKind.CUDA_IPC
+            # Host-staged platforms (and CUDA payloads bound for a CPU target)
+            # go through the shm relay, which _pack_tensors stages via CPU.
             return TransportKind.SHM
         raise ValueError(f"mixed or unsupported tensor devices in payload: {devices}")
 

@@ -116,6 +116,12 @@ def test_qwen_load_code2wav_model_returns_eval_model(monkeypatch) -> None:
     assert model.eval_calls == 1
 
 
+def _cuda_platform_spec():
+    from sglang_omni.platforms import PlatformEnum, ResolvedPlatformSpec
+
+    return ResolvedPlatformSpec(PlatformEnum.CUDA, "cuda", "nccl")
+
+
 def test_qwen_code2wav_factory_default_does_not_build_cuda_graphs(monkeypatch) -> None:
     model = _FactoryModel()
     monkeypatch.setattr(
@@ -227,6 +233,12 @@ def test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys(
     )
     load_call: dict = {}
     build_call: dict = {}
+    # CUDA-path assertions: resolve a cuda platform regardless of the test host.
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "resolve_current_platform",
+        lambda: code2wav_scheduler.OmniPlatform.from_spec(_cuda_platform_spec()),
+    )
     monkeypatch.setattr(
         code2wav_scheduler.torch.cuda,
         "current_device",
@@ -300,6 +312,12 @@ def test_qwen_code2wav_enabled_factory_logs_disabled_build_reason(
         code2wav_scheduler.Code2WavCudaGraphRunner,
         "build",
         staticmethod(lambda *args, **kwargs: runner),
+    )
+    # The graph runner is CUDA-only, so gpu_id must resolve to a cuda device.
+    monkeypatch.setattr(
+        code2wav_scheduler,
+        "resolve_current_platform",
+        lambda: code2wav_scheduler.OmniPlatform.from_spec(_cuda_platform_spec()),
     )
 
     with caplog.at_level(logging.INFO, logger=code2wav_scheduler.__name__):

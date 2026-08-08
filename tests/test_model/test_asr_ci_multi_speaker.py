@@ -32,6 +32,7 @@ from benchmarks.tasks.transcribe_diarize import (
     build_evaluation_payload,
     load_movies800_samples,
 )
+from tests.test_model.conftest import _accelerator_platform
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     launch_managed_router,
@@ -323,10 +324,9 @@ GOOGLETIME_RTF_P95_MAX: float | None = round(
 
 
 def _require_cuda() -> None:
-    import torch
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for MOSS-Transcribe-Diarize CI")
+    if _accelerator_platform() is None:
+        pytest.skip("an accelerator is required for MOSS-Transcribe-Diarize CI")
 
 
 @pytest.fixture(scope="module")

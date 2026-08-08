@@ -28,6 +28,7 @@ from benchmarks.metrics._format import format_benchmark_dataset_label
 from benchmarks.metrics.wer import print_asr_speed_summary, print_asr_wer_summary
 from benchmarks.tasks.asr import DEFAULT_ASR_TRANSCRIBE_CONCURRENCY
 from tests.test_model.asr_ci_config import select_asr_ci_preset
+from tests.test_model.conftest import _accelerator_platform
 from tests.test_model.omni_router_utils import (
     ManagedRouterHandle,
     launch_managed_router,
@@ -52,10 +53,9 @@ STARTUP_TIMEOUT = 600
 
 
 def _require_cuda() -> None:
-    import torch
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for ASR correctness CI")
+    if _accelerator_platform() is None:
+        pytest.skip("an accelerator is required for ASR correctness CI")
 
 
 @pytest.fixture(scope="module")

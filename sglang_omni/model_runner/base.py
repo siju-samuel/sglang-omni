@@ -123,14 +123,21 @@ class ModelRunner:
     def _stage_token_ids(self, result: Any, ids: torch.Tensor) -> None:
         # Note (wenyao): pinned host copy staged once at sample time so downstream
         # .tolist() never triggers a blocking pageable D2H; next_token_ids stays device-side
-        if not (isinstance(ids, torch.Tensor) and ids.is_cuda):
+        # Staging needs an accelerator, not CUDA specifically; the event comes from
+        # the runner's own device module, as execute_launch already does. A CPU
+        # runner has nothing to stage off, so it keeps taking the early return.
+        device = getattr(self, "device", None)
+        staged_type = (
+            device.type if device is not None and device.type != "cpu" else None
+        )
+        if not (isinstance(ids, torch.Tensor) and ids.device.type == staged_type):
             result._host_token_ids = ids
             result._host_token_ids_event = None
             return
         n = ids.shape[0]
         buf = self._next_token_id_host_buf(ids, n)
         buf[:n].copy_(ids[:n], non_blocking=True)
-        event = torch.cuda.Event()
+        event = torch.get_device_module(self.device).Event()
         event.record()
         result._host_token_ids = buf[:n]
         result._host_token_ids_event = event

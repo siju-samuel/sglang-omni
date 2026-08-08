@@ -4,9 +4,15 @@ import re
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
-from sgl_kernel import fused_qk_norm_rope
 from torch import nn
 from transformers import PretrainedConfig
+
+try:
+    from sgl_kernel import fused_qk_norm_rope
+except Exception:  # noqa: BLE001 - CUDA-only kernel; fall back to pure-PyTorch
+    fused_qk_norm_rope = None
+
+from sglang.srt.utils import is_cpu, is_cuda
 
 from sglang_omni.models.qwen3_omni.hf_config import Qwen3OmniMoeTextConfig
 from sglang_omni.models.weight_loader import default_weight_loader
@@ -159,7 +165,7 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         dual_chunk_attention_config: Optional[dict[str, Any]] = None,
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -230,6 +236,8 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
             and self.compatible_with_fused_qk_norm_rope
+            and is_cuda()
+            and fused_qk_norm_rope is not None
         )
         self._used_fused_qk_norm_rope_last_call = False
         self._used_fused_set_kv_buffer_last_call = False
@@ -306,8 +314,10 @@ class Qwen3OmniMoeThinkerTextAttention(nn.Module):
                 head_dim=self.head_dim,
                 alt_stream=self.alt_stream,
             )
+            # Gate on CUDA first: enable_fused_set_kv_buffer raises off CUDA.
             use_fused_set_kv_buffer = (
-                enable_fused_set_kv_buffer(forward_batch)
+                is_cuda()
+                and enable_fused_set_kv_buffer(forward_batch)
                 and self.compatible_with_fused_kv_buffer
             )
             q, k = self.rotary_emb(
@@ -471,7 +481,7 @@ class Qwen3OmniMoeThinkerTextDecoderLayer(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
+        alt_stream: Optional[Any] = None,
     ) -> None:
         super().__init__()
         self.config = config
@@ -623,7 +633,7 @@ class Qwen3OmniMoeThinkerTextModel(nn.Module):
             prefix=add_prefix(prefix, "embed_tokens"),
         )
 
-        alt_stream = torch.cuda.Stream()
+        alt_stream = torch.get_device_module().Stream() if not is_cpu() else None
         result = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Qwen3OmniMoeThinkerTextDecoderLayer(

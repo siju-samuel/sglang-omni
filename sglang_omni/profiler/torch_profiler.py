@@ -9,7 +9,7 @@ import subprocess
 import threading
 from contextlib import nullcontext
 
-from torch.profiler import ProfilerActivity, profile
+from torch.profiler import ProfilerActivity, profile, supported_activities
 
 from .base_profiler import ProfilerBase
 
@@ -18,6 +18,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+
+def _accelerator_activities() -> list[ProfilerActivity]:
+    """The device activities this torch build can actually record.
+
+    ``==`` not ``is``: these are pybind enum members, so identity fails.
+    """
+    return [a for a in supported_activities() if a != ProfilerActivity.CPU]
 
 
 class TorchProfiler(ProfilerBase):
@@ -109,7 +117,9 @@ class TorchProfiler(ProfilerBase):
             # Expensive flags are env-var opt-in (default off keeps the
             # trace tens of MB; all on can hit multi-GB).
             cls._profiler = profile(
-                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                # The build's own accelerator activity, not CUDA's: asking for
+                # CUDA on another backend traces no device kernels at all.
+                activities=[ProfilerActivity.CPU, *_accelerator_activities()],
                 on_trace_ready=trace_handler,
                 record_shapes=os.environ.get("SGLANG_TORCH_PROFILER_RECORD_SHAPES")
                 == "1",

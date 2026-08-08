@@ -398,3 +398,26 @@ assert "sglang_omni.serve.openai_api" not in sys.modules
     )
 
     assert result.returncode == 0, result.stderr or result.stdout
+
+
+def test_properties_without_compute_capability_do_not_crash(monkeypatch) -> None:
+    """Non-CUDA device properties expose no major/minor.
+
+    Guards a regression where direct ``properties.major`` access raised
+    AttributeError on any platform whose properties lack it (e.g. XPU's
+    ``_XpuDeviceProperties``), taking down the whole command.
+    """
+    fake_torch = _FakeTorch()
+    fake_torch.cuda.properties = [
+        SimpleNamespace(name="Accelerator-0", total_memory=24 * 1024**3)
+    ]
+    monkeypatch.setattr(cuda_platform.torch, "cuda", fake_torch.cuda)
+    monkeypatch.setattr(gpu_diagnostics, "_cuda_runtime_version", lambda: None)
+    monkeypatch.setattr(gpu_diagnostics, "_backend_inventory", list)
+
+    report = gpu_diagnostics.collect_gpu_diagnostics(
+        env={}, torch_module=fake_torch, pynvml_module=None
+    )
+
+    assert report["gpus"][0]["name"] == "Accelerator-0"
+    assert report["gpus"][0]["compute_capability"] is None

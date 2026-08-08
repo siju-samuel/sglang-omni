@@ -17,7 +17,11 @@ from sglang_omni.models.qwen3_tts.request_builders import (
     cleanup_prepared_qwen3_tts_request,
     preprocess_qwen3_tts_payload,
 )
-from sglang_omni.platforms import ResolvedPlatformSpec
+from sglang_omni.platforms import (
+    OmniPlatform,
+    ResolvedPlatformSpec,
+    resolve_current_platform,
+)
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.pipeline_state import load_state as _load_pipeline_state
@@ -221,9 +225,19 @@ def create_vocoder_executor(
     attn_implementation: str | None = None,
     max_batch_size: int = 8,
     max_batch_wait_ms: int = 2,
+    platform_spec: "ResolvedPlatformSpec | None" = None,
 ) -> SimpleScheduler:
-    if gpu_id is not None:
-        device = f"cuda:{gpu_id}"
+    # config.py passes a literal "cuda:0"; bind it to the resolved platform so
+    # gpu_id (or the spec's own index) lands on the live accelerator.
+    requested = torch.device(device)
+    if requested.type != "cpu":
+        platform = (
+            OmniPlatform.from_spec(platform_spec)
+            if platform_spec is not None
+            else resolve_current_platform()
+        )
+        index = gpu_id if gpu_id is not None else (requested.index or 0)
+        device = str(platform.get_device(int(index)))
     tokenizer = _load_qwen3_tts_tokenizer(
         model_path,
         device=device,

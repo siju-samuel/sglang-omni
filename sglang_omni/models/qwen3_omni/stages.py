@@ -27,7 +27,11 @@ from sglang_omni.models.qwen3_omni.request_builders import (
     apply_encoder_result,
     build_encoder_request,
 )
-from sglang_omni.platforms import ResolvedPlatformSpec
+from sglang_omni.platforms import (
+    OmniPlatform,
+    ResolvedPlatformSpec,
+    resolve_current_platform,
+)
 from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
@@ -784,14 +788,42 @@ def create_aggregate_executor():
     return SimpleScheduler(_identity)
 
 
+def _encoder_device(
+    device: str,
+    platform_spec: "ResolvedPlatformSpec | None",
+    gpu_id: int | None = None,
+) -> torch.device:
+    """Resolve an encoder's device against the platform and its placement.
+
+    config.py declares a bare ``device="cuda"`` with no index, so the card comes
+    from the stage's assigned ``gpu_id``; falling back to index 0 would put every
+    encoder on card 0 regardless of placement.
+    """
+    requested = torch.device(device)
+    if requested.type == "cpu":
+        return requested
+    platform = (
+        OmniPlatform.from_spec(platform_spec)
+        if platform_spec is not None
+        else resolve_current_platform()
+    )
+    index = gpu_id if gpu_id is not None else (requested.index or 0)
+    return platform.get_device(int(index))
+
+
 def create_image_encoder_executor(
     model_path: str,
     *,
     device: str = "cuda",
     dtype: str | None = None,
+    gpu_id: int | None = None,
+    platform_spec: ResolvedPlatformSpec | None = None,
 ):
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
+    # config.py passes a literal "cuda"; bind it to this stage's assigned card on
+    # the resolved platform.
+    device = str(_encoder_device(device, platform_spec, gpu_id))
     model = Qwen3OmniImageEncoder(model_path=model_path, device=device, dtype=dtype)
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,
@@ -861,9 +893,14 @@ def create_audio_encoder_executor(
     *,
     device: str = "cuda",
     dtype: str | None = None,
+    gpu_id: int | None = None,
+    platform_spec: ResolvedPlatformSpec | None = None,
 ):
     from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
+    # config.py passes a literal "cuda"; bind it to this stage's assigned card on
+    # the resolved platform.
+    device = str(_encoder_device(device, platform_spec, gpu_id))
     model = Qwen3OmniAudioEncoder(model_path=model_path, device=device, dtype=dtype)
     cache = StageOutputCache(
         max_size=QWEN3_ENCODER_CACHE_MAX_ENTRIES,

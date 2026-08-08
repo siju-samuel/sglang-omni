@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from sglang_omni.model_runner.base import ModelRunner
+from tests.unit_test.fixtures.platform import ACCELERATOR
 
 
 class _CountingIds:
@@ -58,10 +59,11 @@ def test_process_prefers_staged_host_copy_and_skips_device_readback():
     assert [outputs[f"r{i}"].data for i in range(3)] == host_ref.tolist()
 
 
-def _bare_runner() -> ModelRunner:
+def _bare_runner(device: str = "cpu") -> ModelRunner:
     runner = ModelRunner.__new__(ModelRunner)
     runner._token_id_host_bufs = None
     runner._token_id_host_slot = 0
+    runner.device = torch.device(device)  # _stage_token_ids stages against it
     return runner
 
 
@@ -160,14 +162,16 @@ def test_pingpong_alternates_slots_and_reuses_backing_buffer(monkeypatch):
     assert third is first
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_stage_token_ids_cuda_matches_reference():
-    runner = _bare_runner()
-    ref = torch.tensor([3, 5, 7, 9], device="cuda")
+@pytest.mark.skipif(ACCELERATOR is None, reason="requires an accelerator")
+def test_stage_token_ids_accelerator_matches_reference():
+    runner = _bare_runner(ACCELERATOR)
+    ref = torch.tensor([3, 5, 7, 9], device=ACCELERATOR)
     result = SimpleNamespace()
 
     runner._stage_token_ids(result, ref)
     host = runner._resolve_host_token_ids(result)
 
-    assert not host.is_cuda
+    # A pinned staged copy, not the CPU early-return: the event proves the
+    # non_blocking D2H really was issued and awaited.
+    assert host.device.type == "cpu" and host.is_pinned()
     assert host.tolist() == ref.cpu().tolist()

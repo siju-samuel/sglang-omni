@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
-from sglang_omni.platforms import ResolvedPlatformSpec
+from sglang_omni.platforms import CudaOmniPlatform, OmniPlatform, ResolvedPlatformSpec
 from sglang_omni.quantization import (
     needs_quant_config_normalization,
     normalize_quant_config,
@@ -148,6 +148,7 @@ class ModelWorker:
             self.server_args,
             self.model_config,
             self.model_arch_override,
+            platform_spec=self.platform_spec,
         )
         _initialize_model_worker_backend_globals(
             self.server_args,
@@ -446,8 +447,41 @@ def _apply_model_worker_backend_policy(
     server_args: ServerArgs,
     model_config: ModelConfig,
     model_arch_override: str | None,
+    *,
+    platform_spec: ResolvedPlatformSpec | None = None,
 ) -> str | None:
     """Apply Omni backend policy after checkpoint quantization is known."""
+
+    platform = (
+        OmniPlatform.from_spec(platform_spec)
+        if platform_spec is not None
+        else CudaOmniPlatform()
+    )
+
+    if platform.is_xpu():
+        from sglang_omni.utils.xpu_sglang_compat import (
+            patch_available_gpu_memory_for_xpu,
+        )
+
+        # Correct XPU free memory before the KV pool is sized against it. The
+        # platform's get_available_memory has no consumer inside SGLang, which is
+        # what actually sizes the pool.
+        patch_available_gpu_memory_for_xpu()
+        if getattr(server_args, "disable_cuda_graph", None) is not True:
+            override_server_args(
+                server_args,
+                "sglang-omni-xpu-backend-policy",
+                disable_cuda_graph=True,
+            )
+            # cuda_graph_config is resolved from the legacy boolean during
+            # __post_init__, so flipping the boolean alone would not stop capture.
+            cuda_graph_config = getattr(server_args, "cuda_graph_config", None)
+            if cuda_graph_config is not None:
+                from sglang.srt.model_executor.cuda_graph_config import Backend
+
+                cuda_graph_config.decode.backend = Backend.DISABLED
+                cuda_graph_config.prefill.backend = Backend.DISABLED
+            logger.info("XPU: disabling CUDA-graph capture (decode runs eager)")
 
     effective_quantization = _normalize_quantization(model_config.quantization)
     server_quantization = _normalize_quantization(server_args.quantization)
@@ -466,6 +500,19 @@ def _apply_model_worker_backend_policy(
         )
     has_moe = _model_config_has_moe(model_config)
     has_native_fp8_block_quant = _model_config_has_native_fp8_block_quant(model_config)
+
+    if is_qwen3_omni_arch and platform.is_xpu():
+        if moe_runner_backend in ("auto", "flashinfer_cutlass", "cutlass"):
+            # SGLang's XPU MoE path asserts the runner is 'triton' (see
+            # layers/quantization/unquant.py forward_xpu); 'auto' and the CUTLASS
+            # runners fail that assert.
+            override_server_args(
+                server_args,
+                "sglang-omni-xpu-backend-policy",
+                moe_runner_backend="triton",
+            )
+            moe_runner_backend = server_args.moe_runner_backend
+            logger.info("Selecting 'triton' MoE runner (XPU MoE path requires it)")
 
     if (
         model_arch_override == "Qwen3OmniTalker"

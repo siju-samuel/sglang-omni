@@ -10,9 +10,10 @@ from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     sample_from_sorted_logprobs_with_seed_small_k,
 )
+from tests.unit_test.fixtures.platform import ACCELERATOR
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Qwen3-TTS sampling kernel needs CUDA"
+    ACCELERATOR is None, reason="Qwen3-TTS sampling kernel needs an accelerator"
 )
 
 
@@ -20,12 +21,14 @@ pytestmark = pytest.mark.skipif(
 def test_seeded_small_k_sampler_matches_sglang_multinomial(
     batch_size: int, num_cols: int
 ) -> None:
-    generator = torch.Generator(device="cuda").manual_seed(batch_size * 100 + num_cols)
+    generator = torch.Generator(device=ACCELERATOR).manual_seed(
+        batch_size * 100 + num_cols
+    )
     probs = torch.rand(
         batch_size,
         num_cols,
         generator=generator,
-        device="cuda",
+        device=ACCELERATOR,
         dtype=torch.float32,
     )
     probs = probs / probs.sum(dim=1, keepdim=True)
@@ -34,11 +37,11 @@ def test_seeded_small_k_sampler_matches_sglang_multinomial(
         8192,
         (batch_size, num_cols),
         generator=generator,
-        device="cuda",
+        device=ACCELERATOR,
         dtype=torch.long,
     )
-    seeds = torch.arange(17, 17 + batch_size, device="cuda", dtype=torch.long)
-    positions = torch.arange(3, 3 + batch_size, device="cuda", dtype=torch.long)
+    seeds = torch.arange(17, 17 + batch_size, device=ACCELERATOR, dtype=torch.long)
+    positions = torch.arange(3, 3 + batch_size, device=ACCELERATOR, dtype=torch.long)
 
     logprobs = probs.log()
     sampled = sample_from_sorted_logprobs_with_seed_small_k(

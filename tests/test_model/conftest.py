@@ -360,14 +360,26 @@ def resolve_qwen3_omni_model_dir(model_path: str) -> Path:
     return Path(snapshot_download(model_path, local_files_only=True))
 
 
+def _accelerator_platform():
+    """The resolved platform if it has a live accelerator, else None.
+
+    Lets these fixtures gate on "an accelerator" instead of CUDA specifically,
+    so the same benchmarks run on any platform the Omni layer supports.
+    """
+    from sglang_omni.platforms import resolve_current_platform
+
+    platform = resolve_current_platform()
+    return None if platform.is_cpu() or platform.device_count() == 0 else platform
+
+
 @pytest.fixture(scope="module")
 def cuda_device():
-    """CUDA device for Qwen3-Omni benchmarks. Skips when CUDA is unavailable
-    or the Qwen3-Omni checkpoint is not in the local HF cache."""
-    import torch
+    """Accelerator device for Qwen3-Omni benchmarks. Skips when there is no
+    accelerator or the Qwen3-Omni checkpoint is not in the local HF cache."""
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
+    platform = _accelerator_platform()
+    if platform is None:
+        pytest.skip("no accelerator available")
     if not _model_cache_present(QWEN3_OMNI_TEST_MODEL_PATH):
         pytest.skip(
             f"{QWEN3_OMNI_TEST_MODEL_PATH} is not in the local HF cache; this "
@@ -375,8 +387,9 @@ def cuda_device():
             f"Pre-populate the cache or set SGLANG_OMNI_TEST_QWEN3_MODEL to a "
             f"local path."
         )
-    torch.cuda.set_device(0)
-    return torch.device("cuda:0")
+    device = platform.get_device(0)
+    platform.set_device(device)
+    return device
 
 
 @pytest.fixture(scope="session")
@@ -393,12 +406,12 @@ def qwen3_omni_vision_sglang_env():
     ``model_parallel_is_initialized`` / ``torch.distributed.is_initialized``
     guards are belt-and-suspenders against an external initializer.
     """
-    import torch
     import torch.distributed as torch_dist
 
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA not available")
-    torch.cuda.set_device(0)
+    platform = _accelerator_platform()
+    if platform is None:
+        pytest.skip("no accelerator available")
+    platform.set_device(platform.get_device(0))
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29550")
@@ -426,7 +439,7 @@ def qwen3_omni_vision_sglang_env():
             rank=0,
             distributed_init_method=f"tcp://127.0.0.1:{os.environ['MASTER_PORT']}",
             local_rank=0,
-            backend="nccl",
+            backend=platform.distributed_backend,
         )
     if not model_parallel_is_initialized():
         initialize_model_parallel(tensor_model_parallel_size=1)

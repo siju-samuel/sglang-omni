@@ -816,11 +816,16 @@ def get_stage_process_env(
         raise ValueError(f"tp stage {spec.stage_name!r} requires a GPU id")
 
     platform = OmniPlatform.from_spec(spec.platform_spec)
-    return {
-        **platform.worker_device_env(spec.gpu_id, source_env),
-        "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS": "true",
+    device_env = platform.worker_device_env(spec.gpu_id, source_env)
+    env_updates = {
+        **device_env,
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false",
     }
+    if device_env:
+        # SGLang reads this to index device 0 instead of local_rank, so it only
+        # holds where a visibility override really did isolate one device.
+        env_updates["SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"] = "true"
+    return env_updates
 
 
 def _prepare_accelerator_environment(
@@ -833,9 +838,31 @@ def _prepare_accelerator_environment(
     if spec.gpu_id is None:
         return
     platform = platform or OmniPlatform.from_spec(spec.platform_spec)
+    visibility_env = platform.device_control_env_var
+    if visibility_env is None:
+        # This platform keeps every device visible, so the rank addresses its own
+        # by id and gpu_id must NOT be normalized to a local 0. An inherited mask
+        # is honored while it still covers this stage's card, because a pinned
+        # subset is a deliberate placement choice; it is only dropped when TP needs
+        # its peers or when the card is outside the mask (which would otherwise
+        # fail with "device index is out of range").
+        # Counted from the mask string, never via device_count(): querying the
+        # runtime would initialize it under the mask, freezing the truncated count
+        # so a later clear could not take effect.
+        masked = platform.inherited_visibility_count(os.environ)
+        if spec.tp_size > 1 or (masked is not None and spec.gpu_id >= masked):
+            platform.clear_inherited_visibility(os.environ, log=log)
+            log.info(
+                "Stage %s rank %d keeps all %s devices visible, using device_id=%s",
+                spec.stage_name,
+                spec.tp_rank,
+                platform.device_name,
+                spec.gpu_id,
+            )
+        return
     if os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS") == "true":
         mapped_device_env = platform.worker_device_env(0, os.environ)
-        visibility_env, mapped_gpu = next(iter(mapped_device_env.items()))
+        mapped_gpu = mapped_device_env.get(visibility_env, str(spec.gpu_id))
         _normalize_spec_gpu_id_to_local_device(spec)
         log.info(
             "TP stage %s rank %d sees %s device=%s (local device_id=0)",
@@ -850,8 +877,6 @@ def _prepare_accelerator_environment(
     if not env_updates:
         return
 
-    visibility_env = platform.device_control_env_var
-    assert visibility_env is not None
     mapped_gpu = env_updates.get(visibility_env, str(spec.gpu_id))
     os.environ.update(env_updates)
 

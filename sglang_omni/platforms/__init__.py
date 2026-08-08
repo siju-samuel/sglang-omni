@@ -17,6 +17,7 @@ from sglang_omni.platforms.interface import (
     ResolvedPlatformSpec,
     TransferPolicy,
 )
+from sglang_omni.platforms.xpu_platform import XpuDeviceMixin, XpuOmniPlatform
 
 
 def resolve_current_platform(torch_module: Any = torch) -> OmniPlatform:
@@ -33,5 +34,7 @@ __all__ = [
     "PlatformEnum",
     "ResolvedPlatformSpec",
     "TransferPolicy",
+    "XpuDeviceMixin",
+    "XpuOmniPlatform",
     "resolve_current_platform",
 ]

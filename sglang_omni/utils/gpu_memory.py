@@ -188,16 +188,29 @@ def get_gpu_device_info(logical_gpu_id: int) -> GpuDeviceInfo:
         _shutdown_nvml(pynvml)
 
 
+def _accelerator_device_type() -> str:
+    """The resolved platform's torch device module name, defaulting to CUDA."""
+    try:
+        from sglang_omni.platforms import resolve_current_platform
+
+        return resolve_current_platform().device_type
+    except Exception:
+        return "cuda"
+
+
 def _get_torch_gpu_device_info(
     logical_gpu_id: int,
     device_id: int | str | None,
 ) -> GpuDeviceInfo:
-    """Return CUDA device metadata available through PyTorch."""
+    """Return accelerator device metadata available through PyTorch."""
     try:
         torch = importlib.import_module("torch")
-        if not torch.cuda.is_available():
-            raise RuntimeError("CUDA is unavailable")
-        properties = torch.cuda.get_device_properties(logical_gpu_id)
+        # The resolved platform's backend, not torch.cuda: a non-CUDA
+        # accelerator would otherwise report no capacity at all.
+        backend = getattr(torch, _accelerator_device_type(), None)
+        if backend is None or not backend.is_available():
+            raise RuntimeError("no accelerator is available")
+        properties = backend.get_device_properties(logical_gpu_id)
         return GpuDeviceInfo(
             logical_gpu_id=logical_gpu_id,
             device_id=device_id,

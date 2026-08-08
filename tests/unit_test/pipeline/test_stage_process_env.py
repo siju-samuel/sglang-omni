@@ -79,6 +79,25 @@ def test_tp_process_env_requires_gpu_id() -> None:
         )
 
 
+def test_xpu_tp_process_env_omits_one_visible_device_flag() -> None:
+    """SGLang reads SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS to index device 0 instead
+    of local_rank. A platform that emits no visibility override keeps every card
+    visible, so setting it would describe the opposite of what happened."""
+    from sglang_omni.platforms import PlatformEnum, ResolvedPlatformSpec
+
+    spec = ResolvedPlatformSpec(PlatformEnum.XPU, "xpu", "xccl")
+    stage = StageLaunchConfig(
+        stage_name="thinker", platform_spec=spec, tp_rank=3, tp_size=8, gpu_id=3
+    )
+
+    env = get_stage_process_env(stage, {})
+
+    assert "SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS" not in env
+    assert "CUDA_VISIBLE_DEVICES" not in env
+    assert "ZE_AFFINITY_MASK" not in env
+    assert env == {"SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false"}
+
+
 def test_tp_child_keeps_parent_mapped_visible_device(monkeypatch) -> None:
     """Child startup normalizes the already-mapped TP device to local cuda:0."""
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "4")
@@ -154,6 +173,8 @@ class _RecordingLog:
         if args:
             message = message % args
         self.messages.append(message)
+
+    warning = info
 
 
 def test_gpu_scheduler_construction_uses_startup_lock(monkeypatch) -> None:
@@ -273,3 +294,36 @@ def test_cpu_scheduler_construction_skips_startup_lock(monkeypatch) -> None:
     scheduler = stage_workers._construct_scheduler(spec, None, _RecordingLog())
 
     assert isinstance(scheduler, FakeScheduler)
+
+
+@pytest.mark.parametrize(
+    ("mask", "gpu_id", "tp_size", "cleared"),
+    [
+        # A pinned subset that still covers the stage's card is a deliberate
+        # placement choice, so it survives.
+        ("3,4", 1, 1, False),
+        # Out of range: honoring it would fail with "device index is out of range".
+        ("6", 1, 1, True),
+        # TP always needs its peers visible for collective discovery.
+        ("6", 0, 8, True),
+    ],
+)
+def test_inherited_xpu_mask_is_dropped_only_when_it_hides_the_stage_card(
+    monkeypatch, mask: str, gpu_id: int, tp_size: int, cleared: bool
+) -> None:
+    from sglang_omni.platforms import PlatformEnum, ResolvedPlatformSpec
+
+    monkeypatch.setenv("ZE_AFFINITY_MASK", mask)
+    spec = StageLaunchConfig(
+        stage_name="code2wav",
+        platform_spec=ResolvedPlatformSpec(PlatformEnum.XPU, "xpu", "xccl"),
+        tp_rank=0,
+        tp_size=tp_size,
+        gpu_id=gpu_id,
+    )
+
+    stage_workers._prepare_accelerator_environment(spec, _RecordingLog())
+
+    assert ("ZE_AFFINITY_MASK" not in os.environ) is cleared
+    # gpu_id is never normalized to a local 0 on a platform without visibility.
+    assert spec.gpu_id == gpu_id

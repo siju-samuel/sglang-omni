@@ -32,6 +32,10 @@ class CudaDeviceMixin(DeviceMixin):
     def get_device_properties(self, device_id: int = 0) -> Any:
         return torch.cuda.get_device_properties(device_id)
 
+    def get_device_capability(self, device_id: int = 0) -> str | None:
+        properties = self.get_device_properties(device_id)
+        return f"{properties.major}.{properties.minor}"
+
     def synchronize(self) -> None:
         torch.cuda.synchronize()
 

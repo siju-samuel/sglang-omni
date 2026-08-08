@@ -251,7 +251,10 @@ def test_get_gpu_device_info_falls_back_to_torch_when_nvml_import_fails(
             assert device_id == 0
             return SimpleNamespace(name="NVIDIA H20", total_memory=96 * 1024**3)
 
-    fake_torch = SimpleNamespace(cuda=_FakeCuda())
+    # Keyed off the resolved platform's device module, so this exercises the
+    # torch fallback on whichever accelerator the test host has.
+    device_type = gpu_memory._accelerator_device_type()
+    fake_torch = SimpleNamespace(**{device_type: _FakeCuda()})
 
     def _import_module(name: str):
         if name == "pynvml":

@@ -97,8 +97,13 @@ def wait_for_gpu_memory_release(
 
     Requires CUDA_VISIBLE_DEVICES (physical ids) so concurrent calibration
     groups cannot wipe each other. Single-tenant CI may omit it when
-    GITHUB_ACTIONS=true.
+    GITHUB_ACTIONS=true. No-op off CUDA: the cleanup script scopes itself with
+    nvidia-smi, so a non-CUDA platform has nothing it can scope or kill.
     """
+    from sglang_omni.platforms import resolve_current_platform
+
+    if not resolve_current_platform().is_cuda():
+        return
     if not GPU_CLEANUP_SCRIPT.exists():
         raise FileNotFoundError(f"GPU cleanup script missing: {GPU_CLEANUP_SCRIPT}")
 
