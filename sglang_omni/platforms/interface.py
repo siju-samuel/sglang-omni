@@ -60,3 +60,9 @@ class OmniPlatform(DeviceMixin):
     def enable_code2wav_graph(self):
         """Check if current platform support Graph for code2wav in Qwen3-Omni"""
         return True
+
+    def sdpa_capture_context(self):
+        """Context that keeps SDPA capturable; a no-op where it already is."""
+        import contextlib
+
+        return contextlib.nullcontext()

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -144,3 +145,38 @@ def test_xpu_platform_resolves_to_the_omni_xpu_platform() -> None:
     assert platform.get_stage_process_env(spec, {"ZE_AFFINITY_MASK": "0,1"}) == {
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false"
     }
+
+
+def test_xpu_pins_the_sdpa_backends_that_can_be_captured(monkeypatch) -> None:
+    from torch.nn import attention
+
+    requested: list[list[attention.SDPBackend]] = []
+    monkeypatch.setattr(
+        attention,
+        "sdpa_kernel",
+        lambda backends: requested.append(list(backends)) or nullcontext(),
+    )
+
+    with xpu_platform.XPUOmniPlatform().sdpa_capture_context():
+        pass
+
+    assert requested == [
+        [
+            attention.SDPBackend.FLASH_ATTENTION,
+            attention.SDPBackend.EFFICIENT_ATTENTION,
+            attention.SDPBackend.MATH,
+        ]
+    ]
+
+
+def test_other_platforms_leave_the_sdpa_dispatch_alone(monkeypatch) -> None:
+    from torch.nn import attention
+
+    def _refuse(backends):
+        raise AssertionError(f"sdpa backends must not be pinned here: {backends}")
+
+    monkeypatch.setattr(attention, "sdpa_kernel", _refuse)
+
+    for platform in (OmniPlatform(), CPUOmniPlatform(), CUDAOmniPlatform()):
+        with platform.sdpa_capture_context():
+            pass

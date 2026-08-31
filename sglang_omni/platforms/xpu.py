@@ -45,6 +45,26 @@ class XPUOmniPlatform(OmniPlatform):
             return None
         return fused_inplace_qknorm_rope
 
+    def sdpa_capture_context(self):
+        """Name the backends that can be captured here.
+
+        The default XPU dispatch reaches a path that waits on an event the graph
+        does not own, so capture aborts with "Graph nodes cannot depend on events
+        from outside the graph." Each backend named here captures and lands the
+        same distance from an fp32 reference as the default does (2.5e-3, bf16 on
+        a B60); torch picks the first one available for the call, since flash
+        declines masked inputs.
+        """
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        )
+
     def apply_model_worker_backend_policy(
         self,
         server_args: ServerArgs,
