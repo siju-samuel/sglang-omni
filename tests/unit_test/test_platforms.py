@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -167,3 +168,38 @@ def test_xpu_keeps_the_qwen3_omni_thinker_decode_eager() -> None:
     assert xpu_platform.XPUOmniPlatform().enable_thinker_decode_graph() is False
     assert OmniPlatform().enable_thinker_decode_graph() is True
     assert CPUOmniPlatform().enable_thinker_decode_graph() is True
+
+
+def test_xpu_pins_the_sdpa_backends_that_can_be_captured(monkeypatch) -> None:
+    from torch.nn import attention
+
+    requested: list[list[attention.SDPBackend]] = []
+    monkeypatch.setattr(
+        attention,
+        "sdpa_kernel",
+        lambda backends: requested.append(list(backends)) or nullcontext(),
+    )
+
+    with xpu_platform.XPUOmniPlatform().sdpa_capture_context():
+        pass
+
+    assert requested == [
+        [
+            attention.SDPBackend.FLASH_ATTENTION,
+            attention.SDPBackend.EFFICIENT_ATTENTION,
+            attention.SDPBackend.MATH,
+        ]
+    ]
+
+
+def test_other_platforms_leave_the_sdpa_dispatch_alone(monkeypatch) -> None:
+    from torch.nn import attention
+
+    def _refuse(backends):
+        raise AssertionError(f"sdpa backends must not be pinned here: {backends}")
+
+    monkeypatch.setattr(attention, "sdpa_kernel", _refuse)
+
+    for platform in (OmniPlatform(), CPUOmniPlatform(), CUDAOmniPlatform()):
+        with platform.sdpa_capture_context():
+            pass

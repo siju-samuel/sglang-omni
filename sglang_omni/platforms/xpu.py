@@ -53,6 +53,26 @@ class XPUOmniPlatform(OmniPlatform):
         # Capture leaves the scheduler thread's stream recording; host reads fail.
         return False
 
+    def sdpa_capture_context(self):
+        """Name the backends that can be captured here.
+
+        The default XPU dispatch reaches a path that waits on an event the graph
+        does not own, so capture aborts with "Graph nodes cannot depend on events
+        from outside the graph." Each backend named here captures and lands the
+        same distance from an fp32 reference as the default does (2.5e-3, bf16 on
+        a B60); torch picks the first one available for the call, since flash
+        declines masked inputs.
+        """
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+
+        return sdpa_kernel(
+            [
+                SDPBackend.FLASH_ATTENTION,
+                SDPBackend.EFFICIENT_ATTENTION,
+                SDPBackend.MATH,
+            ]
+        )
+
     def get_decode_cuda_graph_backend(self) -> str | None:
         # SGLang leaves XPU decode capture opt-in and accepts only full.
         from sglang.srt.model_executor.cuda_graph_config import Backend

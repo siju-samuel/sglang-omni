@@ -67,5 +67,11 @@ class OmniPlatform(DeviceMixin):
     def enable_thinker_decode_graph(self) -> bool:
         return True
 
+    def sdpa_capture_context(self):
+        """Context that keeps SDPA capturable; a no-op where it already is."""
+        import contextlib
+
+        return contextlib.nullcontext()
+
     def get_decode_cuda_graph_backend(self) -> str | None:
         return None
