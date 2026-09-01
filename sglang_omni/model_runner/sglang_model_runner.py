@@ -429,6 +429,10 @@ class SGLModelRunner(ModelRunner):
         deferred graph-capture call sites, so finalize here at the common
         capture boundary instead of relying on every stage to mirror the
         scheduler's post-capture hook.
+
+        On a platform that names SDPA backends, the capture is wrapped to pin them:
+        the engines reach SDPA through model code SGLang's capture does not wrap.
+        Platforms that name none are called exactly as before.
         """
         record = self._weight_share_record
         if record is not None:
@@ -440,7 +444,16 @@ class SGLModelRunner(ModelRunner):
         from sglang.srt.runtime_context import get_exec, get_flags
 
         get_flags().capture.enable_torch_compile = get_exec().graph.enable_torch_compile
-        result = super().init_cuda_graphs(capture_decode_cuda_graph)
+        from sglang_omni.platforms import current_platform
+
+        # Only a platform that names SDPA backends needs the pin. Everywhere else
+        # the capture is called with nothing wrapped around it, so CUDA, ROCm, MUSA
+        # and NPU keep the graph and the numerics they had before this hook existed.
+        if current_platform.get_graph_capture_sdpa_backends():
+            with current_platform.graph_capture_attention():
+                result = super().init_cuda_graphs(capture_decode_cuda_graph)
+        else:
+            result = super().init_cuda_graphs(capture_decode_cuda_graph)
         if self.token_to_kv_pool.post_capture_active:
             self.post_capture_resize_kv_pool()
         return result
