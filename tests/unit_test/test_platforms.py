@@ -283,6 +283,13 @@ def test_xpu_keeps_the_qwen3_omni_thinker_decode_eager() -> None:
     assert CPUOmniPlatform().enable_thinker_decode_graph() is True
 
 
+def test_xpu_keeps_the_qwen3_omni_code_predictor_eager() -> None:
+    """Recording it measured slower than eager on Battlemage; see the override."""
+    assert xpu_platform.XPUOmniPlatform().enable_omni_predictor_graph() is False
+    assert OmniPlatform().enable_omni_predictor_graph() is True
+    assert CPUOmniPlatform().enable_omni_predictor_graph() is True
+
+
 def test_each_platform_names_the_graph_backend_its_hardware_uses() -> None:
     """The accelerators that capture name a backend; the rest answer None.
 

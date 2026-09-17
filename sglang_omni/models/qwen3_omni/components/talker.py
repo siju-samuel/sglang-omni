@@ -5,7 +5,7 @@ SGLang-native Talker model for Qwen3-Omni compatiable with hf formatting.
 from __future__ import annotations
 
 import logging
-from typing import Iterable, Optional, Tuple
+from typing import Any, Iterable, Optional, Tuple
 
 import torch
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
@@ -57,7 +57,7 @@ def _bind_default_weight_loaders(module: nn.Module) -> None:
 
 
 class _PredictorDecodeGraph:
-    """CUDA graph for one Qwen3-Omni predictor single-token decode bucket."""
+    """Device graph for one Qwen3-Omni predictor single-token decode bucket."""
 
     def __init__(
         self,
@@ -85,7 +85,7 @@ class _PredictorDecodeGraph:
             dtype=dtype,
             device=device,
         )
-        self.graph = torch.cuda.CUDAGraph()
+        self.graph: Any | None = None
         self.result_codes: torch.Tensor | None = None
         self.summed_embeddings: torch.Tensor | None = None
         self._capture()
@@ -97,35 +97,64 @@ class _PredictorDecodeGraph:
     @torch.inference_mode()
     def _capture(self) -> None:
         device = self.layer0_codes.device
-        with torch.cuda.device(device):
-            warmup_stream = torch.cuda.Stream(device=device)
-            current_stream = torch.cuda.current_stream(device=device)
-            warmup_stream.wait_stream(current_stream)
-            with torch.cuda.stream(warmup_stream):
-                for _ in range(2):
-                    self.model._code_predictor_forward_incremental_eager(
-                        self.layer0_codes,
-                        self.talker_hidden,
-                    )
-            current_stream.wait_stream(warmup_stream)
+        module = torch.get_device_module(device)
+        backend = current_platform.get_device_graph_backend(device)
+        if backend is None:
+            raise RuntimeError(
+                f"{device.type} names no device graph backend for the Qwen3-Omni "
+                "predictor graph"
+            )
+        captured = None
+        try:
+            with module.device(device):
+                warmup_stream = module.Stream(device=device)
+                current_stream = module.current_stream(device)
+                warmup_stream.wait_stream(current_stream)
+                # The predictor chain reaches SDPA, and XPU's default dispatch is
+                # not capturable; the pin is a nullcontext everywhere else. Warmup
+                # holds it too, so the recorded pass replays what it warmed.
+                with (
+                    current_platform.graph_capture_attention(),
+                    module.stream(warmup_stream),
+                ):
+                    for _ in range(2):
+                        self.model._code_predictor_forward_incremental_eager(
+                            self.layer0_codes,
+                            self.talker_hidden,
+                        )
+                current_stream.wait_stream(warmup_stream)
 
-            capture_stream = torch.cuda.Stream(device=device)
-            capture_stream.wait_stream(current_stream)
-            with torch.cuda.graph(
-                self.graph,
-                stream=capture_stream,
-                capture_error_mode="thread_local",
-            ):
-                self.result_codes, self.summed_embeddings = (
-                    self.model._code_predictor_forward_incremental_eager(
-                        self.layer0_codes,
-                        self.talker_hidden,
+                capture_stream = module.Stream(device=device)
+                capture_stream.wait_stream(current_stream)
+                with (
+                    current_platform.graph_capture_attention(),
+                    backend.capture(
+                        stream=capture_stream,
+                        thread_local_errors=True,
+                    ) as captured,
+                ):
+                    self.result_codes, self.summed_embeddings = (
+                        self.model._code_predictor_forward_incremental_eager(
+                            self.layer0_codes,
+                            self.talker_hidden,
+                        )
                     )
-                )
-            current_stream.wait_stream(capture_stream)
+                current_stream.wait_stream(capture_stream)
+        except Exception:
+            # The caller disables this bucket and keeps serving, so release the
+            # graph's private pool here: the raising object stays reachable from
+            # traceback frames, and a pinned pool is device memory the next
+            # capture cannot have.
+            if captured is not None:
+                try:
+                    captured.reset()
+                except Exception:
+                    pass
+            raise
 
+        self.graph = captured
         if self.result_codes is None or self.summed_embeddings is None:
-            raise RuntimeError("Qwen3-Omni predictor CUDA graph captured no outputs")
+            raise RuntimeError("Qwen3-Omni predictor graph captured no outputs")
 
     @torch.inference_mode()
     def replay(
@@ -136,11 +165,12 @@ class _PredictorDecodeGraph:
         live_batch_size = layer0_codes.shape[0]
         if live_batch_size > self.batch_size:
             raise ValueError(
-                "Qwen3-Omni predictor CUDA graph bucket is too small: "
+                "Qwen3-Omni predictor graph bucket is too small: "
                 f"bucket={self.batch_size}, live={live_batch_size}"
             )
 
-        with torch.cuda.device(self.layer0_codes.device):
+        device = self.layer0_codes.device
+        with torch.get_device_module(device).device(device):
             self.layer0_codes[:live_batch_size].copy_(layer0_codes)
             self.talker_hidden[:live_batch_size].copy_(talker_hidden)
             if live_batch_size < self.batch_size:
@@ -1462,18 +1492,34 @@ class Qwen3OmniTalker(nn.Module):
             return False
         if layer0_codes.dtype not in (torch.int, torch.long):
             return False
-        if not torch.cuda.is_available():
+        # The device is asked first: one that names no graph backend declines
+        # before is_current_stream_capturing(), which torch.cpu and torch.mps
+        # do not have. The graph replays on the device its buffers live on, so
+        # the gate compares the whole device and not its kind.
+        graph_device = self._predictor_input_buffer.device
+        if current_platform.get_device_graph_backend(graph_device) is None:
             return False
-        if not layer0_codes.is_cuda or not talker_hidden.is_cuda:
+        # Recording is platform policy: a chain this small does not pay off on
+        # every accelerator (see XPUOmniPlatform for the measurement).
+        if not current_platform.enable_omni_predictor_graph():
             return False
-        if torch.cuda.is_current_stream_capturing():
+        if layer0_codes.device != graph_device or talker_hidden.device != graph_device:
+            return False
+        if torch.get_device_module(graph_device).is_current_stream_capturing():
             return False
         # Note (zijiecode): SGLang's decode-graph warmup runs this forward before
         # its own capture. On ROCm (torch 2.9) the predictor must not register
         # the CUDA generator first, or SGLang's no_grad capture_begin() fails
         # on the inference tensors it left behind. CUDA keeps the startup-time
         # capture.
-        if current_platform.is_rocm() and get_is_capture_mode():
+        # XPU behaves like ROCm here, and its talker stage dies rather than
+        # falling back: recording the predictor inside SGLang's warmup leaves
+        # inference tensors that XPUGraphRunner's own capture_begin refuses with
+        # "Inplace update to inference tensor outside InferenceMode". The first
+        # real decode records it instead, one eager step later.
+        if get_is_capture_mode() and (
+            current_platform.is_rocm() or current_platform.is_xpu()
+        ):
             return False
         return True
 
@@ -1531,7 +1577,7 @@ class Qwen3OmniTalker(nn.Module):
             except Exception:
                 self._predictor_decode_graph_disabled.add(key)
                 logger.warning(
-                    "Disabling Qwen3-Omni predictor CUDA graph for "
+                    "Disabling Qwen3-Omni predictor graph for "
                     "batch_size=%s dtype=%s",
                     bucket_size,
                     code_dtype,
@@ -1540,8 +1586,7 @@ class Qwen3OmniTalker(nn.Module):
                 return None
             self._predictor_decode_graphs[key] = graph
             logger.info(
-                "Captured Qwen3-Omni predictor CUDA graph for batch_size=%s "
-                "dtype=%s",
+                "Captured Qwen3-Omni predictor graph for batch_size=%s dtype=%s",
                 bucket_size,
                 code_dtype,
             )

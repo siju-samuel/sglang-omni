@@ -117,6 +117,10 @@ class OmniPlatform(DeviceMixin):
     def enable_talker_graph(self) -> bool:
         return True
 
+    def enable_omni_predictor_graph(self) -> bool:
+        """Whether to record Qwen3-Omni's talker code predictor per token."""
+        return True
+
     def enable_thinker_decode_graph(self) -> bool:
         return True
 

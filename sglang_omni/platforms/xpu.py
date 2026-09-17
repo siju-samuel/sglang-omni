@@ -51,6 +51,19 @@ class XPUOmniPlatform(OmniPlatform):
     def enable_talker_graph(self) -> bool:
         return True
 
+    def enable_omni_predictor_graph(self) -> bool:
+        """Measured slower than eager, so the predictor chain stays eager here.
+
+        Qwen3-Omni-30B-A3B speech on 8x Arc Pro B60, one seeded request, 5 warm
+        rounds per arm: 1.834 s eager against 2.080 s recorded, RTF 0.66 against
+        0.75, and the recorded arm's fastest round still trails the eager arm's
+        slowest. The chain is small enough that a replay saves less than the pin
+        costs: capture needs graph_capture_attention(), because XPU's default
+        SDPA dispatch is not capturable, so a replay is locked to the pinned
+        attention kernel while eager keeps its own faster pick.
+        """
+        return False
+
     def enable_thinker_decode_graph(self) -> bool:
         # Capture leaves the scheduler thread's stream recording; host reads fail.
         return False
