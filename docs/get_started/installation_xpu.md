@@ -12,9 +12,11 @@ XPU wheel index.
 family and CUDA-only wheels would replace the `+xpu` stack.
 [`pyproject_xpu.toml`](../../pyproject_xpu.toml) encodes the XPU replacements.
 
-Core deps cover the supported models (Qwen3-ASR / TTS / Omni) plus the API server;
-`[eval]` adds SeedTTS/WER tooling and `[all]` aliases it. Other model families
-(S2-Pro, Ming-Omni, Voxtral-TTS) are CUDA-only and are not offered here.
+Core deps cover the models validated on XPU (Qwen3-ASR / TTS / Omni) plus the API server;
+`[eval]` adds SeedTTS/WER tooling and `[all]` aliases it. No other model family in this
+repo is validated on XPU, and the per-family extras of the CUDA
+[`pyproject.toml`](../../pyproject.toml) (`audar-tts`, `fun-cosyvoice3`) have no counterpart
+here.
 
 > **`--no-build-isolation` is required** — without it pip emits a legacy in-tree
 > `egg-info` instead of a PEP 660 editable install. The installer always passes it.
@@ -26,7 +28,8 @@ Core deps cover the supported models (Qwen3-ASR / TTS / Omni) plus the API serve
 
 ## Prerequisites
 
-- Python ≥ 3.10, and an Intel GPU driver (`/dev/dri/renderD*` present).
+- Python 3.10–3.12 (`pyproject_xpu.toml` requires `>=3.10,<3.13`), and an Intel GPU driver
+  (`/dev/dri/renderD*` present).
 - `setuptools` ≥ 77.0.0 in the target environment (see the note above).
 - The **PyTorch XPU stack** and an **XPU SGLang build** — reuse an existing working
   `torch+xpu` env if you have one. See [Runtime environment](#runtime-environment-important)
@@ -97,6 +100,13 @@ pip install -e . --no-build-isolation --extra-index-url https://download.pytorch
 pip install --no-deps xgrammar==0.1.33
 ```
 
+`xgrammar` is a separate line because SGLang's XPU manifest leaves it out — its `triton`
+requirement is the NVIDIA build, and `--no-deps` keeps that off the `+xpu` Triton stack. It
+is not optional: `sglang.srt.server_args` imports it unconditionally through the
+function-call detectors, so an environment without it aborts every server start with
+`ModuleNotFoundError: No module named 'xgrammar'`, whether or not structured output is used.
+An XPU SGLang environment built before this line needs the same install.
+
 Use that commit: the XPU port targets this SGLang revision's APIs and does not carry
 version-compatibility shims. A VCS requirement (`pip install "sglang @ git+…"`) does **not** work:
 pip reads the checkout's `python/pyproject.toml`, which pins CUDA torch; only the swap above
@@ -128,6 +138,10 @@ build reports `fatal error: sycl/sycl.hpp: No such file or directory`, point the
 ```bash
 export CPATH="$(python -c 'import sysconfig; print(sysconfig.get_paths()["include"])')"
 ```
+
+If you narrow the visible cards with `ZE_AFFINITY_MASK`, keep every card of a tensor-parallel
+group inside the mask — each rank must see its peers for XCCL discovery — and note that
+`--<stage>.gpu` then indexes into the mask, not into the host's card numbering.
 
 ### Qwen3-ASR (speech-to-text, single XPU)
 
@@ -183,10 +197,38 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
        "messages":[{"role":"user","content":"What is Intel XPU?"}],"max_tokens":64}'
 ```
 
+Speech output serves as well, with the talker and Code2Wav stages on top of the same
+tensor-parallel thinker, and both XPU speech graphs capture (talker decode plus the Code2Wav
+vocoder keys). Stage placement for eight 24 GB cards is checked in as
+[`examples/configs/qwen3_omni_speech_xpu_b60.yaml`](../../examples/configs/qwen3_omni_speech_xpu_b60.yaml)
+— thinker TP=8 across all eight, talker on card 6, vocoder on card 7:
+
+```bash
+export SGLANG_OMNI_STARTUP_TIMEOUT=1800
+sgl-omni serve --config examples/configs/qwen3_omni_speech_xpu_b60.yaml \
+  --host 0.0.0.0 --port 8000
+# speak — the WAV comes back base64-encoded in choices[0].message.audio.data,
+# so read the response from a file rather than a shell variable:
+curl -s -X POST http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3-Omni-30B-A3B-Instruct",
+       "messages":[{"role":"user","content":"Say hello from Intel XPU."}],
+       "modalities":["text","audio"],"audio":{"format":"wav"},"max_tokens":64}' -o reply.json
+python -c "import base64, json; \
+  d = json.load(open('reply.json'))['choices'][0]['message']['audio']['data']; \
+  open('out.wav','wb').write(base64.b64decode(d.split(',',1)[-1]))"
+```
+
+> The vocoder's `gpu_memory_fraction` is a fraction of the **whole card**, so the pipeline
+> default (0.02) leaves a 24 GB card less graph budget than the capture keys need. The config
+> above raises it to 0.05; without that the Code2Wav graphs decline with
+> `memory_budget_exceeded` and the stage runs eager.
+
 Health check for any of the above: `curl http://localhost:8000/v1/models`.
 
 > **Expected on XPU:** `Failed to import mooncake` / `Failed to import nixl` warnings are harmless
 > — those CUDA-only transfer backends are omitted; tensors move through the `shm` relay instead.
 
 > ✅ Support status: **Qwen3-ASR, Qwen3-TTS, and Qwen3-Omni all serve end-to-end on Intel XPU**
-> (ASR single-card, TTS single-card, Qwen3-Omni thinker across 8 cards with tensor parallelism).
+> (ASR single-card, TTS single-card, Qwen3-Omni chat and speech across 8 cards with the thinker
+> tensor-parallel).

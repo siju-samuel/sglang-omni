@@ -38,6 +38,7 @@ The other places a version lives:
 | `docker/cpu.Dockerfile` | `SGLANG_IMAGE` (digest of the new tag's `-xeon` manifest) |
 | `docker/xpu.Dockerfile` | `SGLANG_XPU_BRANCH` (the tag) and `SGL_KERNEL_XPU_REF` (the last `sgl-kernel-xpu` commit before the tag) |
 | `pyproject_cpu.toml`, `pyproject_xpu.toml`, `scripts/cpu/install_cpu.sh`, `scripts/xpu/install_xpu.sh` | The verified SGLang tag; the provider pyprojects cannot pin `sglang` because every wheel pulls CUDA torch |
+| `docker/xpu.Dockerfile`, `scripts/xpu/install_xpu.sh`, `docs/get_started/installation_xpu.md` | The `xgrammar` version the XPU stack installs out of band with `--no-deps`, in all three places, because SGLang's XPU manifest omits it and `sglang.srt.server_args` imports it anyway |
 | `docs/get_started/installation.md`, `docs/get_started/installation_cpu.md`, `docs/get_started/installation_xpu.md`, `docs/basic_usage/tts.md`, `docs/cookbook/*.md`, model READMEs | Version names in install instructions |
 | Comments in `sglang_omni/` | Never name a version; state the invariant the code relies on so the text survives the next bump |
 
