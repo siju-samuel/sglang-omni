@@ -48,6 +48,10 @@ def create_relay(relay_type: str, **kwargs) -> Relay:
                 from .nccl import NcclRelay  # noqa: F401 - Register backend.
             elif relay_type == "cuda_ipc":
                 from .cuda_ipc import CudaIpcRelay  # noqa: F401 - Register backend.
+            elif relay_type == "level_zero_ipc":
+                from .level_zero_ipc import (  # noqa: F401 - Register backend.
+                    LevelZeroIpcRelay,
+                )
             elif relay_type == "shm":
                 from .shm import ShmRelay  # noqa: F401 - Register backend.
             elif relay_type == "nixl":

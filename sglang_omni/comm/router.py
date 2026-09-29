@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
@@ -63,8 +63,10 @@ class CommRouter:
         self.traced_transports: dict[tuple[str, str], str] = {}
         self.cuda_ipc_peer_cache: dict[str, bool] = {}
 
-    def cuda_ipc_peer_available(self, target: str) -> bool:
-        """Return whether a GPU edge can use CUDA IPC peer copies."""
+    def device_ipc_peer_available(
+        self, target: str, device_kind: Literal["cuda", "xpu"]
+    ) -> bool:
+        """Return whether a GPU edge can use device-IPC peer copies."""
         cached = self.cuda_ipc_peer_cache.get(target)
         if cached is not None:
             return cached
@@ -89,8 +91,12 @@ class CommRouter:
             pass
 
         if self.gpu_id is None or int(self.gpu_id) != source_gpu:
-            self.warn_cuda_ipc_fallback(
-                target, source_gpu, target_gpu, "source process uses a remapped GPU"
+            self.warn_device_ipc_fallback(
+                target,
+                source_gpu,
+                target_gpu,
+                device_kind,
+                "source process uses a remapped GPU",
             )
             self.cuda_ipc_peer_cache[target] = False
             return False
@@ -99,33 +105,50 @@ class CommRouter:
         try:
             source_local = int(self.gpu_id)
             target_local = target_gpu
-            if (
-                source_local >= torch.cuda.device_count()
-                or target_local >= torch.cuda.device_count()
-            ):
-                raise RuntimeError("GPU is outside this process's visible CUDA range")
+            if device_kind == "cuda":
+                device_count = torch.cuda.device_count()
+            else:
+                device_count = torch.xpu.device_count()
+            if source_local >= device_count or target_local >= device_count:
+                raise RuntimeError(
+                    f"GPU is outside this process's visible {device_kind} range"
+                )
             else:
                 pass
-            available = bool(
-                torch.cuda.can_device_access_peer(target_local, source_local)
-            )
+            if device_kind == "cuda":
+                available = bool(
+                    torch.cuda.can_device_access_peer(target_local, source_local)
+                )
+            else:
+                available = bool(
+                    torch.xpu.can_device_access_peer(target_local, source_local)
+                )
         except Exception as exc:
-            self.warn_cuda_ipc_fallback(
-                target, source_gpu, target_gpu, f"peer query failed: {exc}"
+            self.warn_device_ipc_fallback(
+                target, source_gpu, target_gpu, device_kind, f"peer query failed: {exc}"
             )
             self.cuda_ipc_peer_cache[target] = False
             return False
         if not available:
-            self.warn_cuda_ipc_fallback(
-                target, source_gpu, target_gpu, "peer access is unsupported"
+            self.warn_device_ipc_fallback(
+                target,
+                source_gpu,
+                target_gpu,
+                device_kind,
+                "peer access is unsupported",
             )
         else:
             pass
         self.cuda_ipc_peer_cache[target] = available
         return available
 
-    def warn_cuda_ipc_fallback(
-        self, target: str, source_gpu: int, target_gpu: int, reason: str
+    def warn_device_ipc_fallback(
+        self,
+        target: str,
+        source_gpu: int,
+        target_gpu: int,
+        device_kind: Literal["cuda", "xpu"],
+        reason: str,
     ) -> None:
         key = (self.stage_name, target, source_gpu, target_gpu, reason)
         if key in _CUDA_IPC_FALLBACK_WARNED:
@@ -134,12 +157,9 @@ class CommRouter:
             pass
         _CUDA_IPC_FALLBACK_WARNED.add(key)
         logger.warning(
-            "CommRouter: using SHM for CUDA edge %s(gpu=%d) -> %s(gpu=%d): %s",
-            self.stage_name,
-            source_gpu,
-            target,
-            target_gpu,
-            reason,
+            f"CommRouter: using SHM for {device_kind} edge "
+            f"{self.stage_name}(gpu={source_gpu}) -> {target}(gpu={target_gpu}): "
+            f"{reason}"
         )
 
     @property
@@ -156,11 +176,16 @@ class CommRouter:
         )
 
     def intra_node_transport(self, target: str) -> TransportKind:
-        # The peer probe reads torch.cuda and warns about a CUDA fallback, so it must
-        # run only once the platform has actually chosen CUDA IPC.
+        # The peer probe reads one vendor's torch namespace and warns about that
+        # vendor's fallback, so it runs only once the platform has chosen its IPC.
         transport = current_platform.get_intra_node_transport()
-        if transport is TransportKind.CUDA_IPC and not self.cuda_ipc_peer_available(
-            target
+        if transport is TransportKind.CUDA_IPC and not self.device_ipc_peer_available(
+            target, "cuda"
+        ):
+            return TransportKind.SHM
+        elif (
+            transport is TransportKind.LEVEL_ZERO_IPC
+            and not self.device_ipc_peer_available(target, "xpu")
         ):
             return TransportKind.SHM
         else:
@@ -347,6 +372,31 @@ class CommRouter:
         cuda_ipc_pool_size_mb = (
             cfg["cuda_ipc_pool_size_mb"] if "cuda_ipc_pool_size_mb" in cfg else None
         )
+        if kind is TransportKind.LEVEL_ZERO_IPC:
+            if self.gpu_id is None:
+                raise ValueError(
+                    f"level_zero_ipc relay requested for non-GPU stage "
+                    f"{self.stage_name!r}"
+                )
+            else:
+                pass
+            level_zero_options: dict[str, int] = {}
+            if "level_zero_ipc_slot_size_kb" in cfg:
+                level_zero_options["slot_size_kb"] = cfg["level_zero_ipc_slot_size_kb"]
+            else:
+                pass
+            if "level_zero_ipc_pool_size_mb" in cfg:
+                level_zero_options["pool_size_mb"] = cfg["level_zero_ipc_pool_size_mb"]
+            else:
+                pass
+            return create_relay(
+                "level_zero_ipc",
+                engine_id=engine_id,
+                device=f"xpu:{self.gpu_id}",
+                **level_zero_options,
+            )
+        else:
+            pass
         if kind is TransportKind.CUDA_IPC:
             if self.gpu_id is None:
                 raise ValueError(

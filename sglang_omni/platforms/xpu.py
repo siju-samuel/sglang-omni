@@ -36,6 +36,16 @@ class XPUOmniPlatform(OmniPlatform):
         index = device.index if isinstance(device, torch.device) else int(device)
         torch.xpu.set_device(0 if index is None else index)
 
+    def get_intra_node_transport(self) -> TransportKind:
+        """Prefer Level-Zero IPC over host staging for GPU-to-GPU stage edges."""
+        from sglang_omni.comm.data_ref import TransportKind
+        from sglang_omni.relay.level_zero import is_level_zero_ipc_available
+
+        if is_level_zero_ipc_available():
+            return TransportKind.LEVEL_ZERO_IPC
+        else:
+            return TransportKind.SHM
+
     def enable_code2wav_graph(self):
         return True
 

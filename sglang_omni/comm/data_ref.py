@@ -11,6 +11,7 @@ import msgspec
 class TransportKind(str, Enum):
     LOCAL_OBJECT = "local_object"
     CUDA_IPC = "cuda_ipc"
+    LEVEL_ZERO_IPC = "level_zero_ipc"
     SHM = "shm"
     MOONCAKE = "mooncake"
 

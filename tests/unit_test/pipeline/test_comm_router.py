@@ -299,10 +299,10 @@ def test_a_non_cuda_platform_never_runs_the_cuda_peer_probe(monkeypatch) -> None
         stage_gpu_ids={"vocoder": (1,)},
     )
 
-    def fail(target):
-        raise AssertionError(f"peer probe ran for {target!r} off CUDA")
+    def fail(target, device_kind):
+        raise AssertionError(f"{device_kind} peer probe ran for {target!r} off CUDA")
 
-    monkeypatch.setattr(router, "cuda_ipc_peer_available", fail)
+    monkeypatch.setattr(router, "device_ipc_peer_available", fail)
 
     assert router.outbound("vocoder") is TransportKind.SHM
     assert router.inbound("vocoder") is TransportKind.SHM
@@ -327,8 +327,12 @@ def test_a_cuda_platform_still_falls_back_when_peers_cannot_talk(monkeypatch) ->
         stage_gpu_ids={"vocoder": (1,)},
     )
 
-    monkeypatch.setattr(router, "cuda_ipc_peer_available", lambda target: False)
+    monkeypatch.setattr(
+        router, "device_ipc_peer_available", lambda target, device_kind: False
+    )
     assert router.outbound("vocoder") is TransportKind.SHM
 
-    monkeypatch.setattr(router, "cuda_ipc_peer_available", lambda target: True)
+    monkeypatch.setattr(
+        router, "device_ipc_peer_available", lambda target, device_kind: True
+    )
     assert router.outbound("vocoder") is TransportKind.CUDA_IPC
