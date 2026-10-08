@@ -6,10 +6,14 @@ import logging
 import os
 import time
 from collections.abc import Callable, Mapping
-from typing import TypedDict
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import Protocol, TypedDict
 
 import torch
 import torch.distributed as dist
+
+from sglang_omni.platforms import current_platform
+from sglang_omni.utils.device import device_guard
 
 from .base import CreditAllocator, Relay, RelayOperation, register_relay
 
@@ -48,6 +52,7 @@ class Connection:
         world_size: int,
         send_ranks: list[int],
         recv_ranks: list[int],
+        device_type: str,
     ) -> None:
         self.name = engine_id
         self.rank = rank
@@ -62,25 +67,26 @@ class Connection:
         else:
             pass
 
+        device_module = torch.get_device_module(device_type)
         if not dist.is_initialized():
             os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
             os.environ.setdefault("MASTER_PORT", "29500")
 
-            if torch.cuda.is_available():
-                self.device_id = rank % torch.cuda.device_count()
-                torch.cuda.set_device(self.device_id)
+            if device_module.is_available():
+                self.device_id = rank % device_module.device_count()
+                device_module.set_device(self.device_id)
             else:
                 self.device_id = 0
 
             dist.init_process_group(
-                "nccl",
+                current_platform.get_torch_distributed_backend_str(),
                 rank=rank,
                 world_size=world_size,
-                device_id=torch.device(f"cuda:{self.device_id}"),
+                device_id=torch.device(device_type, self.device_id),
             )
         else:
             self.device_id = (
-                torch.cuda.current_device() if torch.cuda.is_available() else 0
+                device_module.current_device() if device_module.is_available() else 0
             )
 
         self.group = dist.new_group(list(range(world_size)))
@@ -115,7 +121,7 @@ class NcclOperation(RelayOperation):
     def __init__(
         self,
         connection: Connection,
-        work_handle: dist.Work | None,
+        work_handle: dist.Work | Future[dist.Work] | None,
         tensor_ref: torch.Tensor,
         metadata: NcclPutMetadata | None = None,
     ) -> None:
@@ -131,6 +137,12 @@ class NcclOperation(RelayOperation):
             self._metadata
         )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
+    async def await_issue(self, timeout: float) -> None:
+        if isinstance(self.work, Future):
+            self.work = await asyncio.wait_for(asyncio.wrap_future(self.work), timeout)
+        else:
+            pass
+
 
 class PutOperation(NcclOperation):
     """Handle for a Put operation (NCCL isend)."""
@@ -138,7 +150,7 @@ class PutOperation(NcclOperation):
     def __init__(
         self,
         connection: Connection,
-        work_handle: dist.Work | None,
+        work_handle: dist.Work | Future[dist.Work] | None,
         tensor_ref: torch.Tensor,
         metadata: NcclPutMetadata,
         on_completion_cb: Callable[[], None] | None = None,
@@ -154,6 +166,7 @@ class PutOperation(NcclOperation):
 
         start = time.time()
         try:
+            await self.await_issue(timeout)
             while not self.work.is_completed():
                 if time.time() - start > timeout:
                     raise TimeoutError(f"PutOperation timed out")
@@ -179,7 +192,7 @@ class GetOperation(NcclOperation):
     def __init__(
         self,
         connection: Connection,
-        work_handle: dist.Work | None,
+        work_handle: dist.Work | Future[dist.Work] | None,
         dest_tensor: torch.Tensor,
     ) -> None:
         super().__init__(connection, work_handle, dest_tensor, metadata=None)
@@ -192,6 +205,7 @@ class GetOperation(NcclOperation):
 
         start = time.time()
         try:
+            await self.await_issue(timeout)
             while not self.work.is_completed():
                 if time.time() - start > timeout:
                     raise TimeoutError(f"GetOperation timed out")
@@ -204,6 +218,10 @@ class GetOperation(NcclOperation):
             self.completed = True
 
 
+class PointToPointCall(Protocol):
+    def __call__(self) -> dist.Work: ...
+
+
 @register_relay("nccl")
 class NcclRelay(Relay):
     def __init__(
@@ -213,24 +231,34 @@ class NcclRelay(Relay):
         recv_from_ranks: list[int],
         slot_size_mb: int = 64,
         credits: int = 2,
-        device: str = "cuda",
+        device: str | None = None,
         rank: int | None = None,
         world_size: int = 2,
     ) -> None:
-        self.engine_id = engine_id
-        self.device = device
-
-        self.device_id = 0
-        if "cuda" in device and ":" in device:
-            try:
-                self.device_id = int(device.split(":")[1])
-            except ValueError:
-                self.device_id = 0
+        if current_platform.is_cuda_alike():
+            self.issue_thread = None
+        elif len(send_to_ranks) + len(recv_from_ranks) > 1:
+            raise NotImplementedError(
+                f"the nccl relay on {current_platform.device_type} connects a rank to "
+                f"one peer in one direction; got send_to_ranks={send_to_ranks} and "
+                f"recv_from_ranks={recv_from_ranks}. XCCL runs one point-to-point "
+                f"call per process and each waits for the peer's matching call, so a "
+                f"second peer or direction can deadlock."
+            )
         else:
-            pass
+            # note (siju): an XCCL isend returns only once the peer posts its irecv,
+            # which it does on the metadata put_async returns.
+            self.issue_thread = ThreadPoolExecutor(1, f"{engine_id}-p2p")
+        self.engine_id = engine_id
+        resolved_device = torch.device(
+            current_platform.device_type if device is None else device
+        )
+        self.device = str(resolved_device)
+        self.device_id = 0 if resolved_device.index is None else resolved_device.index
 
-        if torch.cuda.is_available():
-            torch.cuda.set_device(self.device_id)
+        device_module = torch.get_device_module(resolved_device.type)
+        if device_module.is_available():
+            device_module.set_device(self.device_id)
         else:
             pass
 
@@ -246,6 +274,7 @@ class NcclRelay(Relay):
             world_size,
             send_ranks=send_to_ranks,
             recv_ranks=recv_from_ranks,
+            device_type=resolved_device.type,
         )
         self.allocator = CreditAllocator(credits=credits)
 
@@ -259,7 +288,9 @@ class NcclRelay(Relay):
             f"[{engine_id}] Initialized NCCL Relay on {device} (Rank {rank}). Starting Warmup..."
         )
 
-        dummy_tensor = torch.tensor([1.0], device=f"cuda:{self.device_id}")
+        dummy_tensor = torch.tensor(
+            [1.0], device=torch.device(resolved_device.type, self.device_id)
+        )
         warmup_reqs = []
 
         try:
@@ -313,9 +344,17 @@ class NcclRelay(Relay):
 
         credit_id = await self.allocator.acquire_async()
 
-        work_handle = dist.isend(
-            tensor=tensor, dst=dst_rank, group=self.connection.group
-        )
+        if self.issue_thread is None:
+            work_handle = dist.isend(
+                tensor=tensor, dst=dst_rank, group=self.connection.group
+            )
+        else:
+            work_handle = self.issue(
+                tensor,
+                lambda: dist.isend(
+                    tensor=tensor, dst=dst_rank, group=self.connection.group
+                ),
+            )
 
         payload: NcclPutMetadata = {
             "engine_id": self.engine_id,
@@ -354,7 +393,17 @@ class NcclRelay(Relay):
         else:
             pass
 
-        work = dist.irecv(tensor=dest_tensor, src=src_rank, group=self.connection.group)
+        if self.issue_thread is None:
+            work = dist.irecv(
+                tensor=dest_tensor, src=src_rank, group=self.connection.group
+            )
+        else:
+            work = self.issue(
+                dest_tensor,
+                lambda: dist.irecv(
+                    tensor=dest_tensor, src=src_rank, group=self.connection.group
+                ),
+            )
 
         return GetOperation(
             connection=self.connection,
@@ -362,10 +411,24 @@ class NcclRelay(Relay):
             dest_tensor=dest_tensor,
         )
 
+    def issue(self, tensor: torch.Tensor, call: PointToPointCall) -> Future[dist.Work]:
+        device_module = torch.get_device_module(tensor.device)
+        stream = device_module.current_stream(tensor.device)
+
+        def run() -> dist.Work:
+            with device_guard(tensor.device), device_module.stream(stream):
+                return call()
+
+        return self.issue_thread.submit(run)
+
     def cleanup(self, request_id: str) -> None:
         pass
 
     def close(self) -> None:
+        if self.issue_thread is not None:
+            self.issue_thread.shutdown(wait=False, cancel_futures=True)
+        else:
+            pass
         if dist.is_initialized():
             dist.destroy_process_group()
         else:
