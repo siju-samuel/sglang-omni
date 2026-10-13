@@ -181,6 +181,7 @@ Community & Resources
    :caption: Cookbook
 
    cookbook/companies/qwen.md
+   cookbook/companies/aura_team.md
    cookbook/companies/openmoss.md
    cookbook/companies/openai.md
    cookbook/companies/nvidia.md
