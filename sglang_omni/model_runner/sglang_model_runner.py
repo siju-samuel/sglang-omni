@@ -10,6 +10,7 @@ from threading import Lock
 
 import torch
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.sampler import (
     Sampler,
@@ -562,6 +563,18 @@ class SGLModelRunner(ModelRunner):
 
         from sglang_omni.platforms import current_platform
 
+        if (
+            capture_decode_cuda_graph
+            and get_parallel().tp_size > 1
+            and not current_platform.graph_capture_records_collectives(get_tp_group())
+        ):
+            logger.warning(
+                "Collectives captured in a device graph do not replay on this install "
+                "(on XPU: oneCCL older than 2022.1.2); serving decode eagerly"
+            )
+            capture_decode_cuda_graph = False
+        else:
+            pass
         with contextlib.ExitStack() as pins:
             if current_platform.is_xpu():
                 pins.enter_context(current_platform.graph_capture_attention())

@@ -6,7 +6,9 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import torch
+import torch.distributed as dist
 from sglang.srt.arg_groups.model_override_base import resolved_view
+from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.platforms.xpu import XpuDeviceMixin
 
 from sglang_omni.platforms.interface import JointRopeInplaceKernel, OmniPlatform
@@ -59,10 +61,6 @@ class XPUOmniPlatform(XpuDeviceMixin, OmniPlatform):
     def enable_tts_vocoder_fast_path(self) -> bool:
         return False
 
-    def enable_thinker_decode_graph(self) -> bool:
-        # Capture leaves the scheduler thread's stream recording; host reads fail.
-        return False
-
     def enable_zonos2_torch_compile(self) -> bool:
         return False
 
@@ -102,6 +100,49 @@ class XPUOmniPlatform(XpuDeviceMixin, OmniPlatform):
         # Note (siju): a host read inside a capture raises on XPU, which is what
         # the Mimi encoder's mask helper does.
         return False
+
+    def graph_capture_records_collectives(self, group: GroupCoordinator) -> bool:
+        if group.world_size == 1:
+            return True
+        else:
+            pass
+        # Note (siju): oneCCL 2022.1.1, which torch 2.14.0+xpu pins, drops an all-reduce or
+        # all-gather issued during XPU graph capture without an error, so a TP decode graph
+        # would replay stale activations. Capture both, replay, and compare on every rank.
+        device = torch.device("xpu", torch.xpu.current_device())
+        rank_value = float(group.rank_in_group + 1)
+        reduced = torch.full((64,), rank_value, device=device)
+        local = torch.full((64,), rank_value, device=device)
+        gathered = torch.zeros(group.world_size * 64, device=device)
+        dist.all_reduce(reduced, group=group.device_group)
+        dist.all_gather_into_tensor(gathered, local, group=group.device_group)
+        torch.xpu.synchronize()
+        graph = torch.xpu.XPUGraph()
+        stream = torch.xpu.Stream()
+        stream.wait_stream(torch.xpu.current_stream())
+        with torch.xpu.graph(graph, stream=stream):
+            dist.all_reduce(reduced, group=group.device_group)
+            dist.all_gather_into_tensor(gathered, local, group=group.device_group)
+        reduced.fill_(10 * rank_value)
+        local.fill_(10 * rank_value)
+        gathered.zero_()
+        torch.xpu.synchronize()
+        dist.barrier(group=group.cpu_group)
+        graph.replay()
+        torch.xpu.synchronize()
+        expected_gathered = 10 * torch.arange(
+            1, group.world_size + 1, device=device, dtype=gathered.dtype
+        ).repeat_interleave(64)
+        is_recorded = torch.tensor(
+            int(
+                torch.all(
+                    reduced == 5 * group.world_size * (group.world_size + 1)
+                ).item()
+                and torch.equal(gathered, expected_gathered)
+            )
+        )
+        dist.all_reduce(is_recorded, op=dist.ReduceOp.MIN, group=group.cpu_group)
+        return bool(is_recorded.item())
 
     def apply_model_worker_backend_policy(
         self,

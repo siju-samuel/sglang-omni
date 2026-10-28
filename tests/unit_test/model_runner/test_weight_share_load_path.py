@@ -295,6 +295,72 @@ def test_a_non_xpu_platform_captures_unwrapped():
     assert calls == ["capture"]
 
 
+@pytest.mark.parametrize("is_recorded", [True, False])
+def test_tensor_parallel_decode_capture_follows_the_collective_probe(
+    monkeypatch, is_recorded
+):
+    from sglang_omni.platforms import current_platform
+
+    tp_group = object()
+    probed_groups = []
+    captured_decode = []
+    monkeypatch.setattr(
+        sglang_model_runner,
+        "get_parallel",
+        lambda: SimpleNamespace(tp_size=8, pp_size=1),
+    )
+    monkeypatch.setattr(sglang_model_runner, "get_tp_group", lambda: tp_group)
+    runner = bare_runner()
+
+    def probe(group):
+        probed_groups.append(group)
+        return is_recorded
+
+    with (
+        get_context().override_server_args(),
+        mock.patch.object(current_platform, "graph_capture_records_collectives", probe),
+        mock.patch.object(
+            ModelRunner,
+            "init_cuda_graphs",
+            lambda self, capture_decode_cuda_graph=True: captured_decode.append(
+                capture_decode_cuda_graph
+            ),
+        ),
+    ):
+        runner.init_cuda_graphs()
+
+    assert probed_groups == [tp_group]
+    # A dropped collective would replay stale activations, so decode stays eager.
+    assert captured_decode == [is_recorded]
+
+
+def test_single_rank_decode_capture_skips_the_collective_probe():
+    from sglang_omni.platforms import current_platform
+
+    captured_decode = []
+
+    def fail_if_probed(group):
+        raise AssertionError("one rank has no collective to probe")
+
+    runner = bare_runner()
+    with (
+        get_context().override_server_args(),
+        mock.patch.object(
+            current_platform, "graph_capture_records_collectives", fail_if_probed
+        ),
+        mock.patch.object(
+            ModelRunner,
+            "init_cuda_graphs",
+            lambda self, capture_decode_cuda_graph=True: captured_decode.append(
+                capture_decode_cuda_graph
+            ),
+        ),
+    ):
+        runner.init_cuda_graphs()
+
+    assert captured_decode == [True]
+
+
 def test_graph_capture_reseeds_torch_compile_from_the_exec_bag():
     runner = bare_runner()
 
