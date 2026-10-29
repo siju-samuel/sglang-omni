@@ -447,3 +447,42 @@ def test_finalize_default_batch_generation_hook_calls_single_hook() -> None:
     )
 
     assert calls == [("req-1", 1), ("req-2", 5)]
+
+
+def test_launch_ids_go_straight_to_the_pinned_buffer_where_the_copy_is_async(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "supports_async_device_to_host_copy", lambda: True
+    )
+    runner = make_runner([], custom_result=None)
+    ids = torch.tensor([7, 8])
+    host_buf = torch.zeros(4, dtype=ids.dtype)
+
+    launch_ids = runner.snapshot_launch_ids(ids, host_buf)
+    ids.fill_(0)  # the next launch reuses the sampler's output buffer
+
+    assert launch_ids is host_buf
+    assert runner.host_launch_ids(launch_ids)[:2].tolist() == [7, 8]
+
+
+def test_launch_ids_stay_on_device_where_the_host_copy_would_wait_for_the_forward(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from sglang_omni.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "supports_async_device_to_host_copy", lambda: False
+    )
+    runner = make_runner([], custom_result=None)
+    ids = torch.tensor([7, 8])
+    host_buf = torch.zeros(4, dtype=ids.dtype)
+
+    launch_ids = runner.snapshot_launch_ids(ids, host_buf)
+    ids.fill_(0)  # the next launch reuses the sampler's output buffer
+
+    assert launch_ids is not host_buf
+    assert host_buf.tolist() == [0, 0, 0, 0]
+    assert runner.host_launch_ids(launch_ids).tolist() == [7, 8]
