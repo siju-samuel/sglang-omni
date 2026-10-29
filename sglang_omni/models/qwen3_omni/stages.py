@@ -41,6 +41,7 @@ from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
+    GenerationStageDefaults,
     build_default_prefill_cuda_graph_bs,
     build_generation_batch_overrides,
     operator_selected_prefill_backend,
@@ -1266,6 +1267,12 @@ def create_sglang_thinker_executor_from_config(
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
     server_args_overrides = disable_torch_compile_on_npu(server_args_overrides)
+    thinker_attention_backend = current_platform.get_thinker_attention_backend(tp_size)
+    platform_defaults: GenerationStageDefaults = (
+        {}
+        if thinker_attention_backend is None
+        else {"attention_backend": thinker_attention_backend}
+    )
     overrides = build_generation_batch_overrides(
         max_running_requests=64,
         server_args_overrides=server_args_overrides,
@@ -1276,6 +1283,7 @@ def create_sglang_thinker_executor_from_config(
         chunked_prefill_size=8192,
         sampling_backend="flashinfer" if current_platform.is_cuda() else "pytorch",
         cuda_graph_backend_prefill=prefill_graph_backend,
+        **platform_defaults,
     )
     overrides["tp_size"] = tp_size
     if execution_mode == "session":
