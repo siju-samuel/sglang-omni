@@ -178,16 +178,46 @@ def handle_file_for_model(dir_path: str, model: torch.nn.Module) -> str:
 
 def gpu_uuid() -> str | None:
     # Note (Jiaxin Deng): binds a publication to the physical GPU it was
-    # exported from; None off CUDA so CPU tests stay lenient.
-    if not torch.cuda.is_available():
+    # exported from; None off an accelerator so CPU tests stay lenient.
+    from sglang_omni.platforms import current_platform
+
+    if current_platform.is_cuda_alike():
+        device_module = torch.cuda
+    elif current_platform.is_xpu():
+        device_module = torch.xpu
+    else:
+        return None
+    if not device_module.is_available():
         return None
     else:
         pass
     try:
-        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        props = device_module.get_device_properties(device_module.current_device())
         return str(getattr(props, "uuid", "") or "") or None
     except Exception:
         return None
+
+
+def default_serializer() -> WeightTensorSerializer:
+    """The handle format this platform publishes aliasable weights in."""
+    from sglang_omni.platforms import current_platform
+
+    if current_platform.is_xpu():
+        from sglang_omni.utils.xpu_weight_ipc import XpuLevelZeroSerializer
+
+        return XpuLevelZeroSerializer
+    else:
+        return SglangIpcSerializer
+
+
+def default_alias_predicate() -> Callable[[torch.Tensor], bool]:
+    """Which tensors this platform can publish a zero-copy handle for."""
+    from sglang_omni.platforms import current_platform
+
+    if current_platform.is_xpu():
+        return lambda t: t.device.type == "xpu"
+    else:
+        return lambda t: t.is_cuda
 
 
 # Note (Jiaxin Deng): held open for the leader's lifetime so the flock lease
@@ -699,9 +729,9 @@ def export_weights(
         os.unlink(abs_path)
     else:
         pass
-    serializer = SglangIpcSerializer if serializer is None else serializer
+    serializer = default_serializer() if serializer is None else serializer
     alias_predicate = (
-        (lambda t: t.is_cuda) if alias_predicate is None else alias_predicate
+        default_alias_predicate() if alias_predicate is None else alias_predicate
     )
 
     tensors = named_shared_tensors(model)
@@ -985,7 +1015,7 @@ def attach_and_check(
     run_id: str | None = None,
     private_names: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, tuple[int, tuple[int, ...], torch.dtype]], WeightSharePayload]:
-    serializer = SglangIpcSerializer if serializer is None else serializer
+    serializer = default_serializer() if serializer is None else serializer
     wait_for_export(file_path, timeout_s, poll_interval_s)
     payload = load_payload(file_path, model, validate_secure=validate_secure)
     check_model_identity(payload, model_path, model_revision, file_path, run_id=run_id)
@@ -1188,12 +1218,12 @@ def alias_from_payload(
             )
         else:
             pass
-        if incoming.is_cuda and incoming.device != own.device:
+        if incoming.device.type != "cpu" and incoming.device != own.device:
             # Note (Jiaxin Deng): a UUID-remap failure would otherwise surface
             # later as a mixed-device kernel error that never names weight sharing.
             raise WeightShareError(
                 f"tensor {name!r} arrived on {incoming.device}, expected "
-                f"{own.device}: CUDA IPC handle mapped to the wrong device"
+                f"{own.device}: the IPC handle mapped to the wrong device"
             )
         else:
             pass

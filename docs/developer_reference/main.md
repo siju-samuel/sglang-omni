@@ -134,7 +134,7 @@ Markdown pages must appear in a toctree in `docs/**/*.rst` or a fenced MyST `{to
 Only these pages are exempt from navigation inclusion; emoji, fence-label, and filename checks still apply:
 
 - `README.md`: repository overview, separate from the published manual.
-- `design/gpu_radix_hash.md` and `design/refactor_rfc.md`: internal notes outside the user manual.
+- `design/gpu_radix_hash.md`, `design/refactor_rfc.md` and `design/intel_xpu_weight_sharing.md`: internal notes outside the user manual.
 - `developer_reference/mlx.md`: excluded redirect; the published page is `mlx/index.md`.
 - `get_started/apiserver_quickstart.md`: linked from other pages, outside the sidebar.
 - `basic_usage/python_router.md`: retained until the Python router is removed separately.

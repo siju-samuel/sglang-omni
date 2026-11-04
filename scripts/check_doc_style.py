@@ -23,6 +23,9 @@ TOCTREE_EXEMPTIONS = {
     "README.md": "Repository overview, separate from the published manual.",
     "design/gpu_radix_hash.md": "Internal design note, outside the user manual.",
     "design/refactor_rfc.md": "Internal refactoring proposal, outside the user manual.",
+    "design/intel_xpu_weight_sharing.md": (
+        "Internal design note, outside the user manual."
+    ),
     "developer_reference/mlx.md": "Excluded redirect; the published page is mlx/index.md.",
     "get_started/apiserver_quickstart.md": "Linked from other pages, outside the sidebar.",
     "basic_usage/python_router.md": "Retained until the Python router is removed separately.",
