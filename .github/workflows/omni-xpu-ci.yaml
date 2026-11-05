@@ -54,6 +54,9 @@ on:
   pull_request:
     types: [opened, labeled, synchronize, reopened, ready_for_review]
   workflow_dispatch:
+  schedule:
+    # 17:00 Beijing. Runs the nightly tier, which adds what cannot gate a PR.
+    - cron: '0 9 * * *'
 
 concurrency:
   group: xpu-ci-${{ github.event.pull_request.number || github.ref }}
@@ -70,8 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      xpu: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.xpu }}
-      image: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.image }}
+      xpu: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.xpu }}
+      image: ${{ github.event_name != 'pull_request' && 'true' || steps.filter.outputs.image }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -81,9 +84,8 @@ jobs:
           filters: |
             xpu:
               - 'sglang_omni/**'
-              - 'tests/unit_test/xpu/**'
-              - 'tests/unit_test/dots_tts/**'
-              - 'tests/unit_test/nemotron3_5_asr/**'
+              - 'tests/unit_test/**'
+              - 'scripts/ci/xpu/**'
               - 'pyproject_xpu.toml'
               - 'scripts/xpu/**'
               - 'docker/xpu.Dockerfile'
@@ -100,7 +102,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       exact_sha: ${{ steps.meta.outputs.exact_sha }}
-      run_intel_xpu: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.plan.outputs.run_intel_xpu }}
+      run_intel_xpu: ${{ github.event_name != 'pull_request' && 'true' || steps.plan.outputs.run_intel_xpu }}
     steps:
       - name: Fetch latest PR gate state
         if: ${{ github.event_name == 'pull_request' }}
@@ -171,7 +173,7 @@ jobs:
         run: echo "Manual workflow_dispatch bypasses PR lint/mergeability gate."
 
   xpu-ci:
-    name: xpu-ci (device_layer)
+    name: xpu-ci (unit_test)
     needs: [check-changes, preflight]
     if: >-
       needs.check-changes.outputs.xpu == 'true' &&
@@ -268,18 +270,17 @@ jobs:
           docker exec "${CONTAINER_NAME}" bash -c "command -v sycl-ls >/dev/null && sycl-ls || true"
 
       - name: Run Unit Test
-        timeout-minutes: 15
+        timeout-minutes: 30
         shell: bash
+        env:
+          # A scheduled run also takes the files that cannot gate a pull request.
+          TIER: ${{ github.event_name == 'schedule' && 'nightly' || 'pr' }}
         run: |
           set -euxo pipefail
           docker exec -w /workspace/sglang-omni-pr "${CONTAINER_NAME}" \
             pip install --no-cache-dir pytest pytest-asyncio
-          docker exec -w /workspace/sglang-omni-pr "${CONTAINER_NAME}" \
-            pytest tests/unit_test/xpu/test_device_layer.py \
-              tests/unit_test/dots_tts/test_flow_head.py \
-              tests/unit_test/dots_tts/test_tail.py \
-              tests/unit_test/nemotron3_5_asr/test_hf_compat.py \
-              tests/unit_test/nemotron3_5_asr/test_model_runner.py -v -x
+          docker exec -w /workspace/sglang-omni-pr -e TIER "${CONTAINER_NAME}" \
+            bash scripts/ci/xpu/xpu_unit_tests.sh "${TIER}"
 
       - name: Cleanup container and image
         if: always()
