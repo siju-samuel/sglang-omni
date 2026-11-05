@@ -1,0 +1,1088 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Record and re-check per-model accuracy and speed for the models Intel XPU serves.
+
+A run serves each model with the recipe from docs/get_started/installation_xpu.md, sends a fixed request set, and compares the result against a committed baseline, so "is this branch slower or less correct than the last known-good tree" has an answer that does not depend on anyone remembering numbers.
+
+Four comparison classes, because the stack pins some outputs and not others:
+
+    exact   text output and sample rate. Greedy decode with the radix cache off makes a transcript or a chat answer reproducible, so these must match character for character.
+    atmost  round-trip word error rate, held under an absolute ceiling.
+    loose   generated audio duration and loudness. CreateSpeechRequest carries no seed or temperature, so /v1/audio/speech cannot pin TTS sampling: Qwen3-TTS was measured emitting 92160 to 134400 frames for one fixed input across six repeats. A wide band here catches a dead or truncated vocoder and nothing finer, which is why audio models are scored on round-trip text instead.
+    speed   latency and throughput, with a directional relative floor.
+
+Reproducibility is asserted, not assumed: an exact field that disagrees across repeats fails the run rather than being written to the baseline. That check is what found the TTS sampling jitter.
+
+Speed is the median of repeated samples after two discarded warmups, at concurrency 1. Concurrency 1 is deliberate: Qwen3-TTS throughput at concurrency 4 has been seen to swing by more than 1.5x between runs of one tree on this hardware, which is too noisy to gate on.
+
+A speed field is allowed the larger of a floor and three times the spread it showed when it was recorded, because one tolerance for every model is wrong in both directions at once: in one B60 sweep Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent, so a shared 10 percent would let a 5 percent ASR regression through while still flaring on Whisper.
+
+Baselines are per environment. The file holds one entry per host, card model, cards and torch/sglang version, and a check against an environment the file has never seen stops rather than comparing numbers that were never comparable.
+
+Usage:
+    xpu_model_baseline.py --list
+    xpu_model_baseline.py --models qwen3-asr,qwen3-tts --record
+    xpu_model_baseline.py --models qwen3-asr,qwen3-tts
+    xpu_model_baseline.py --models qwen3-tts --calibrate --repeats 9
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import io
+import json
+import math
+import os
+import re
+import socket
+import statistics
+import subprocess
+import sys
+import time
+import wave
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable
+
+import requests
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
+from benchmarks.benchmarker.utils import (  # noqa: E402  (needs REPO_ROOT on sys.path)
+    start_server_from_cmd,
+    stop_server,
+)
+
+DATA_DIR = REPO_ROOT / "tests" / "data"
+REFERENCE_AUDIO = DATA_DIR / "query_to_cars.wav"
+REFERENCE_TEXT = "How many cars are there in the picture?"
+SPOKEN_TEXT = "The quick brown fox jumps over the lazy dog."
+ARITHMETIC_PROMPT = "Answer with the number only: 17 plus 25?"
+MUSIC_PROMPT = "A short calm piano melody."
+
+DEFAULT_BASELINE = REPO_ROOT / "scripts" / "xpu" / "xpu_model_baseline.json"
+
+# Engine knobs that make a stage reproducible, applied to every engine stage a model declares.
+#
+# SGLang's own enable_deterministic_inference is deliberately absent. With no explicit
+# attention_backend it rewrites the backend to fa3 on anything that is not SM100/SM120,
+# which is CUDA-only and kills the server on XPU; naming a backend to avoid that would pin
+# a kernel choice and change the very speed this script measures. Whisper cannot use it at
+# all, because XPU pins torch_native cross-attention and that is not in SGLang's
+# deterministic backend list.
+DETERMINISM_ENGINE_ARGS = {
+    "disable_radix_cache": "true",
+    "random_seed": "0",
+}
+
+
+@dataclass(frozen=True)
+class XpuModel:
+    """One servable model: how to launch it, how to ask it, how to score it."""
+
+    key: str
+    name: str
+    model_path: str
+    probe: str
+    cards: int = 1
+    serve_args: tuple[str, ...] = ()
+    # Why this model cannot be measured here. Non-empty means skip, not fail.
+    unservable: str = ""
+    payload: dict[str, Any] = field(default_factory=dict)
+    # Extra process environment the guide's recipe calls for.
+    env: dict[str, str] = field(default_factory=dict)
+    # Another model key, served alongside, that transcribes this model's audio back to text.
+    judge: str = ""
+    startup_seconds: int = 900
+    # False where the recipe is transcribed from the guide but this script has not served it here.
+    verified: bool = False
+
+
+MODELS: tuple[XpuModel, ...] = (
+    XpuModel(
+        key="qwen3-asr",
+        name="Qwen3-ASR",
+        model_path="Qwen/Qwen3-ASR-1.7B",
+        probe="transcription",
+        # The metadata glue graph is CUDA-only and leaves ASR without a transcript on main.
+        env={"SGLANG_ENABLE_METADATA_GLUE_GRAPH": "0"},
+        verified=True,
+    ),
+    XpuModel(
+        key="whisper",
+        name="Whisper large-v3",
+        model_path="openai/whisper-large-v3",
+        probe="transcription",
+    ),
+    XpuModel(
+        key="fun-asr",
+        name="Fun-ASR-Nano",
+        model_path="FunAudioLLM/Fun-ASR-Nano-2512-hf",
+        probe="transcription",
+    ),
+    XpuModel(
+        key="qwen3-tts",
+        name="Qwen3-TTS Base",
+        model_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        probe="speech",
+        payload={
+            "voice": "default",
+            "ref_audio": str(REFERENCE_AUDIO),
+            "ref_text": REFERENCE_TEXT,
+        },
+        judge="qwen3-asr",
+        verified=True,
+    ),
+    XpuModel(
+        key="qwen3-tts-cv",
+        name="Qwen3-TTS CustomVoice",
+        model_path="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+        probe="speech",
+        payload={"voice": "Ryan", "task_type": "CustomVoice", "language": "English"},
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="cosyvoice3",
+        name="Fun-CosyVoice3",
+        model_path="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
+        probe="speech",
+        payload={
+            "voice": "default",
+            "ref_audio": str(REFERENCE_AUDIO),
+            "ref_text": REFERENCE_TEXT,
+        },
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="zonos2",
+        name="ZONOS2",
+        model_path="Zyphra/zonos2",
+        probe="speech",
+        payload={"voice": "default"},
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="dots-tts",
+        name="dots.tts SOAR",
+        model_path="dots-studio/dots.tts-soar",
+        probe="speech",
+        serve_args=("--config", "examples/configs/dots_tts_soar.yaml"),
+        payload={"voice": "default"},
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="minimax-music3",
+        name="MiniMax Music 3",
+        model_path="MiniMaxAI/MiniMax-Music3",
+        probe="music",
+        cards=2,
+        serve_args=("--mem-fraction-static", "0.7"),
+        payload={"voice": "default"},
+    ),
+    XpuModel(
+        key="ming-tts",
+        name="Ming-Omni-TTS",
+        model_path="inclusionAI/Ming-omni-tts-16.8B-A3B",
+        probe="speech",
+        cards=2,
+        serve_args=(
+            "--tts_engine.tp_size",
+            "2",
+            "--tts_engine.gpu",
+            "[0, 1]",
+            "--reference_encode.gpu",
+            "0",
+            "--audio_decode.gpu",
+            "0",
+            "--tts_engine.gpu_memory_fraction",
+            "0.78",
+            "--tts_engine.engine.mem_fraction_static",
+            "0.78",
+        ),
+        payload={"voice": "default"},
+        startup_seconds=1800,
+    ),
+    XpuModel(
+        key="qwen3-omni-text",
+        name="Qwen3-Omni thinker (text only)",
+        model_path="Qwen/Qwen3-Omni-30B-A3B-Instruct",
+        probe="chat",
+        cards=8,
+        serve_args=(
+            "--text-only",
+            "--thinker.process",
+            "thinker",
+            "--thinker.tp_size",
+            "8",
+            "--thinker.gpu",
+            "[0, 1, 2, 3, 4, 5, 6, 7]",
+        ),
+        startup_seconds=2400,
+    ),
+    XpuModel(
+        key="moss-transcribe-diarize",
+        name="MOSS-Transcribe-Diarize",
+        model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        probe="transcription",
+        serve_args=(
+            "--asr.engine.max_running_requests",
+            "16",
+            "--asr.engine.cuda_graph_max_bs",
+            "16",
+            "--asr.engine.enable_torch_compile",
+            "false",
+            "--mem-fraction-static",
+            "0.70",
+        ),
+    ),
+    XpuModel(
+        key="nemotron35-asr",
+        name="Nemotron 3.5 ASR",
+        model_path="nvidia/nemotron-3.5-asr-streaming-0.6b",
+        probe="transcription",
+    ),
+    XpuModel(
+        key="arkasr",
+        name="ARK-ASR",
+        model_path="AutoArk-AI/ARK-ASR-3B",
+        probe="transcription",
+    ),
+    XpuModel(
+        key="higgs",
+        name="Higgs Audio v3 TTS",
+        model_path="bosonai/higgs-audio-v3-tts-4b",
+        probe="speech",
+        serve_args=("--allowed-local-media-path", "docs/_static/audio"),
+        payload={"voice": "default"},
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="auk",
+        name="AuK",
+        model_path="tencent/AuK",
+        probe="speech",
+        # Without reference audio AuK requires a generation length.
+        payload={
+            "voice": "default",
+            "instructions": "A warm, relaxed voice.",
+            "stage_params": {"auk_engine": {"gen_seconds": 4}},
+        },
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="auk-flash",
+        name="AuK-Flash",
+        model_path="tencent/AuK-Flash",
+        probe="speech",
+        payload={
+            "voice": "default",
+            "instructions": "A warm, relaxed voice.",
+            "stage_params": {"auk_engine": {"gen_seconds": 4}},
+        },
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="qwen3-tts-vd",
+        name="Qwen3-TTS VoiceDesign",
+        model_path="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        probe="speech",
+        serve_args=("--config", "examples/configs/qwen3_tts_1_7b_voicedesign.yaml"),
+        payload={
+            "voice": "default",
+            "task_type": "VoiceDesign",
+            "instructions": "A warm, natural young adult voice.",
+        },
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="dots-tts-base",
+        name="dots.tts Base",
+        model_path="dots-studio/dots.tts-base",
+        probe="speech",
+        # Base shares SOAR's config; the solver settings live there, not on the CLI.
+        serve_args=("--config", "examples/configs/dots_tts_soar.yaml"),
+        payload={"voice": "default"},
+        judge="qwen3-asr",
+    ),
+    XpuModel(
+        key="ming-flash-omni",
+        name="Ming-flash-omni-2.0",
+        model_path="inclusionAI/Ming-flash-omni-2.0",
+        probe="chat",
+        serve_args=("--model-name", "ming-omni"),
+        startup_seconds=1800,
+    ),
+    XpuModel(
+        key="minicpm-o",
+        name="MiniCPM-o 4.5",
+        model_path="openbmb/MiniCPM-o-4_5",
+        probe="chat",
+        serve_args=("--text-only",),
+        startup_seconds=1800,
+    ),
+    XpuModel(
+        key="personaplex",
+        name="PersonaPlex",
+        model_path="nvidia/personaplex-7b-v1",
+        probe="speech",
+        unservable="runs through examples/run_personaplex.py, not an HTTP server",
+    ),
+    XpuModel(
+        key="nemotron-voicechat",
+        name="Nemotron VoiceChat",
+        model_path="nvidia/NVIDIA-NemotronLabs-VoiceChat-11B",
+        probe="speech",
+        unservable="runs through examples/run_nemotron_voicechat.py, not an HTTP server",
+    ),
+    XpuModel(
+        key="audar-tts",
+        name="Audar-TTS V1 Turbo",
+        model_path="AudarAI/Audar-TTS-V1-Turbo",
+        probe="speech",
+        unservable="needs the audar-tts extra and a SYCL build of llama.cpp, not an SGLang engine",
+    ),
+)
+
+MODEL_BY_KEY = {model.key: model for model in MODELS}
+SINGLE_CARD_KEYS = tuple(model.key for model in MODELS if model.cards == 1)
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    """Word-level edit distance over reference length.
+
+    Written out rather than taken from jiwer: jiwer lives in the eval extra, and an XPU install does not have it.
+    """
+    want = normalize_text(reference).split()
+    got = normalize_text(hypothesis).split()
+    if not want:
+        return 0.0 if not got else 1.0
+
+    previous = list(range(len(got) + 1))
+    for i, want_word in enumerate(want, start=1):
+        current = [i]
+        for j, got_word in enumerate(got, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (want_word != got_word),
+                )
+            )
+        previous = current
+    return previous[-1] / len(want)
+
+
+def environment_fingerprint(card_pool: str) -> dict[str, str]:
+    """Identify the machine a baseline belongs to, so numbers are never compared across hosts."""
+    import torch
+
+    device = "unknown"
+    if hasattr(torch, "xpu") and torch.xpu.is_available():
+        device = torch.xpu.get_device_properties(0).name
+
+    try:
+        import sglang
+
+        sglang_version = sglang.__version__
+    except Exception:
+        sglang_version = "unknown"
+
+    return {
+        "host": socket.gethostname(),
+        "device": device,
+        "card_pool": card_pool,
+        "torch": torch.__version__,
+        "sglang": sglang_version,
+    }
+
+
+def fingerprint_key(fingerprint: dict[str, str]) -> str:
+    blob = json.dumps(fingerprint, sort_keys=True).encode()
+    return hashlib.sha256(blob).hexdigest()[:12]
+
+
+def recorded_from_commit() -> str:
+    """The tree a baseline came from. Informational: a new commit must not invalidate it."""
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def normalize_text(text: str) -> str:
+    """Collapse whitespace, case and punctuation so a comparison is not defeated by formatting."""
+    return re.sub(r"[^a-z0-9 ]", "", re.sub(r"\s+", " ", text).strip().lower())
+
+
+def audio_shape(raw: bytes) -> dict[str, float]:
+    """Frame count, rate and loudness of a WAV payload.
+
+    Only the rate is stable across runs. Frame count follows the sampling, which /v1/audio/speech cannot pin, so the caller decides which band each field belongs in.
+    """
+    with wave.open(io.BytesIO(raw)) as handle:
+        frames = handle.getnframes()
+        rate = handle.getframerate()
+        width = handle.getsampwidth()
+        payload = handle.readframes(frames)
+
+    if frames == 0 or rate == 0:
+        raise AssertionError("audio holds no frames")
+
+    scale = float(1 << (8 * width - 1))
+    samples = memoryview(payload).cast({1: "b", 2: "h", 4: "i"}[width])
+    peak = max(abs(sample) for sample in samples) / scale
+    rms = math.sqrt(sum((sample / scale) ** 2 for sample in samples) / len(samples))
+    if peak <= 0.01:
+        raise AssertionError(
+            f"audio peaks at {peak:.4f} of full scale, which is silence"
+        )
+
+    return {
+        "frames": float(frames),
+        "sample_rate": float(rate),
+        "audio_seconds": frames / rate,
+        "peak": peak,
+        "rms": rms,
+    }
+
+
+def transcribe(base_url: str, model_path: str, audio: bytes, name: str) -> str:
+    response = requests.post(
+        f"{base_url}/v1/audio/transcriptions",
+        files={"file": (name, audio, "audio/wav")},
+        data={"model": model_path, "temperature": "0"},
+        timeout=300,
+    )
+    response.raise_for_status()
+    return response.json().get("text", "")
+
+
+def probe_transcription(base_url: str, model: XpuModel, judge_url: str) -> dict:
+    del judge_url
+    audio = REFERENCE_AUDIO.read_bytes()
+    started = time.perf_counter()
+    transcript = transcribe(base_url, model.model_path, audio, REFERENCE_AUDIO.name)
+    elapsed = time.perf_counter() - started
+    if not transcript.strip():
+        raise AssertionError("empty transcript")
+
+    reference_seconds = audio_shape(audio)["audio_seconds"]
+    return {
+        "exact": {"transcript": normalize_text(transcript)},
+        "atmost": {"word_error_rate": word_error_rate(REFERENCE_TEXT, transcript)},
+        "speed": {
+            "latency_s": elapsed,
+            "audio_seconds_per_wall_second": reference_seconds / elapsed,
+        },
+    }
+
+
+def synthesize(
+    base_url: str, model: XpuModel, text: str, timeout: int
+) -> tuple[bytes, float]:
+    body = {
+        "model": model.model_path,
+        "input": text,
+        "response_format": "wav",
+        **model.payload,
+    }
+    started = time.perf_counter()
+    response = requests.post(f"{base_url}/v1/audio/speech", json=body, timeout=timeout)
+    elapsed = time.perf_counter() - started
+    response.raise_for_status()
+    return response.content, elapsed
+
+
+def probe_speech(base_url: str, model: XpuModel, judge_url: str) -> dict:
+    audio, elapsed = synthesize(base_url, model, SPOKEN_TEXT, timeout=600)
+    shape = audio_shape(audio)
+    result: dict[str, Any] = {
+        "exact": {"sample_rate": shape["sample_rate"]},
+        "atmost": {},
+        # Duration and loudness ride the unpinnable sampling; they only catch a vocoder
+        # that went silent or stopped early.
+        "loose": {
+            "audio_seconds": shape["audio_seconds"],
+            "peak": shape["peak"],
+            "rms": shape["rms"],
+        },
+        "speed": {
+            "latency_s": elapsed,
+            "audio_seconds_per_wall_second": shape["audio_seconds"] / elapsed,
+        },
+    }
+    if judge_url:
+        heard = transcribe(
+            judge_url, MODEL_BY_KEY[model.judge].model_path, audio, "tts.wav"
+        )
+        result["atmost"]["round_trip_wer"] = word_error_rate(SPOKEN_TEXT, heard)
+        result["heard"] = normalize_text(heard)
+    return result
+
+
+def probe_music(base_url: str, model: XpuModel, judge_url: str) -> dict:
+    del judge_url
+    audio, elapsed = synthesize(base_url, model, MUSIC_PROMPT, timeout=900)
+    shape = audio_shape(audio)
+    return {
+        "exact": {"sample_rate": shape["sample_rate"]},
+        "loose": {"audio_seconds": shape["audio_seconds"], "rms": shape["rms"]},
+        "speed": {"latency_s": elapsed},
+    }
+
+
+def probe_chat(base_url: str, model: XpuModel, judge_url: str) -> dict:
+    del judge_url
+    body = {
+        "model": model.model_path,
+        "messages": [{"role": "user", "content": ARITHMETIC_PROMPT}],
+        "max_tokens": 32,
+        "temperature": 0,
+        "seed": 0,
+    }
+    started = time.perf_counter()
+    response = requests.post(f"{base_url}/v1/chat/completions", json=body, timeout=600)
+    elapsed = time.perf_counter() - started
+    response.raise_for_status()
+    payload = response.json()
+    content = payload["choices"][0]["message"]["content"]
+    if not content:
+        raise AssertionError("no assistant content")
+    completion_tokens = payload.get("usage", {}).get("completion_tokens", 0)
+    speed = {"latency_s": elapsed}
+    if completion_tokens:
+        speed["decode_tokens_per_second"] = completion_tokens / elapsed
+    return {"exact": {"content": normalize_text(content)}, "speed": speed}
+
+
+PROBES: dict[str, Callable[[str, XpuModel, str], dict]] = {
+    "transcription": probe_transcription,
+    "speech": probe_speech,
+    "music": probe_music,
+    "chat": probe_chat,
+}
+
+COMPARED_GROUPS = ("exact", "atmost", "loose", "speed")
+
+# Probes whose endpoint cannot pin how much output the model generates, because
+# CreateSpeechRequest carries no seed or temperature. Measured on a B60, Qwen3-TTS spread
+# 76 percent on latency and 222 percent on throughput across repeats of one input, both
+# tracking the generated length rather than the stack's speed. Their timing and loudness
+# are recorded for trend-watching and never gated; round-trip text is the gate instead.
+UNPINNED_OUTPUT_PROBES = {"speech", "music"}
+
+
+ENGINE_STAGE_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+def engine_stages(model_path: str) -> tuple[str, ...]:
+    """Stage names that own an SGLang engine, read from the model's own pipeline config.
+
+    Derived rather than listed per model: a stage-scoped override aimed at a stage the
+    pipeline does not have is rejected only when the engine is built, minutes into a load.
+    """
+    if model_path in ENGINE_STAGE_CACHE:
+        return ENGINE_STAGE_CACHE[model_path]
+    try:
+        from sglang_omni.config.manager import resolve_config_cls_for_model_path
+
+        config = resolve_config_cls_for_model_path(model_path)(model_path=model_path)
+        stages = tuple(
+            stage.name for stage in config.stages if getattr(stage, "engine", None)
+        )
+    except Exception as exc:
+        print(f"  could not derive engine stages ({exc}); serving without them")
+        stages = ()
+    ENGINE_STAGE_CACHE[model_path] = stages
+    return stages
+
+
+def serve_command(model: XpuModel, port: int, extra: tuple[str, ...] = ()) -> list[str]:
+    command = [
+        sys.executable,
+        "-m",
+        "sglang_omni.cli",
+        "serve",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--model-path",
+        model.model_path,
+        *model.serve_args,
+        *extra,
+    ]
+    for stage in engine_stages(model.model_path):
+        for key, value in DETERMINISM_ENGINE_ARGS.items():
+            command += [f"--{stage}.engine.{key}", value]
+    return command
+
+
+def launch(model: XpuModel, cards: str, extra: tuple[str, ...] = ()) -> tuple[Any, str]:
+    port = free_port()
+    env = dict(os.environ, ZE_AFFINITY_MASK=cards, **model.env)
+    env.setdefault("SGLANG_OMNI_STARTUP_TIMEOUT", str(model.startup_seconds))
+    command = serve_command(model, port, extra)
+    print(f"  serving {model.key} on card(s) {cards}, port {port}", flush=True)
+    proc = start_server_from_cmd(
+        command,
+        None,
+        port,
+        timeout=model.startup_seconds,
+        env=env,
+        strip_proxy=True,
+        health_path="/v1/models",
+        health_body_contains=None,
+    )
+    return proc, f"http://127.0.0.1:{port}"
+
+
+def allocate_cards(pool: list[int], count: int, taken: set[int]) -> str:
+    """Lowest-numbered unused cards from the pool, as a ZE_AFFINITY_MASK.
+
+    Deterministic so a model lands on the same cards every run: on the reference host three
+    of the eight negotiate PCIe at 5 GT/s instead of 27, and a baseline that wandered
+    between them would be comparing two different machines.
+    """
+    free = [card for card in pool if card not in taken]
+    if len(free) < count:
+        raise AssertionError(
+            f"need {count} card(s), pool {pool} has {len(free)} free ({sorted(taken)} in use)"
+        )
+    chosen = free[:count]
+    taken.update(chosen)
+    return ",".join(str(card) for card in chosen)
+
+
+def measure(
+    model: XpuModel,
+    pool: list[int],
+    repeats: int,
+    warmups: int,
+    extras: dict[str, tuple[str, ...]],
+) -> dict:
+    """Serve the model, and its judge when it has one, then sample it warmups+repeats times."""
+    servers = []
+    taken: set[int] = set()
+    cards = allocate_cards(pool, model.cards, taken)
+    try:
+        judge_url = ""
+        if model.judge:
+            judge = MODEL_BY_KEY[model.judge]
+            judge_proc, judge_url = launch(
+                judge,
+                allocate_cards(pool, judge.cards, taken),
+                extras.get(judge.key, ()),
+            )
+            servers.append(judge_proc)
+        proc, base_url = launch(model, cards, extras.get(model.key, ()))
+        servers.append(proc)
+
+        samples = []
+        for index in range(warmups + repeats):
+            sample = PROBES[model.probe](base_url, model, judge_url)
+            label = (
+                f"warmup {index + 1}"
+                if index < warmups
+                else f"rep {index - warmups + 1}"
+            )
+            extra = (
+                f" wer={sample['atmost']['round_trip_wer']:.4f}"
+                if sample.get("atmost", {}).get("round_trip_wer") is not None
+                else ""
+            )
+            print(f"    {label}: {sample['speed']}{extra}", flush=True)
+            samples.append(sample)
+    finally:
+        for proc in reversed(servers):
+            stop_server(proc)
+
+    folded = fold_samples(samples[warmups:])
+    if model.probe in UNPINNED_OUTPUT_PROBES:
+        # Renamed so compare() cannot reach them.
+        for group in ("loose", "speed"):
+            folded[f"{group}_informational"] = folded.pop(group)
+    return folded
+
+
+def fold_samples(samples: list[dict]) -> dict:
+    """Collapse repeats: exact fields must agree, numeric fields take the median."""
+    folded: dict[str, Any] = {group: {} for group in COMPARED_GROUPS}
+    folded["spread"] = {}
+    for group in COMPARED_GROUPS:
+        for key in samples[0].get(group, {}):
+            values = [sample[group][key] for sample in samples]
+            if group == "exact":
+                unique = set(values)
+                if len(unique) != 1:
+                    raise AssertionError(
+                        f"{key} is not reproducible across repeats: {sorted(unique)}"
+                    )
+                folded[group][key] = values[0]
+                continue
+            folded[group][key] = statistics.median(values)
+            if len(values) > 1 and folded[group][key]:
+                span = (max(values) - min(values)) / folded[group][key]
+                folded["spread"][f"{group}.{key}"] = round(span, 4)
+                if group == "speed" and still_warming(values):
+                    print(
+                        f"    still warming on {key}: samples move one way across the whole run "
+                        f"({values[0]:.6g} to {values[-1]:.6g}); raise --warmups before trusting the spread"
+                    )
+    return folded
+
+
+def still_warming(values: list[float]) -> bool:
+    """True when the first half of the scored run sits apart from the second, which is a warmup curve rather than noise.
+
+    Comparing halves rather than checking monotonicity: a settling server ties or ticks the wrong way once, and either defeats a per-sample test while the drift is still there. Whisper on a B60 ran 0.4451, 0.4472, 0.4421, 0.4339, 0.4105 -- down 7.8 percent overall, with rep 2 breaking the slope.
+    """
+    if len(values) < 4:
+        return False
+    middle = statistics.median(values)
+    if not middle:
+        return False
+    half = len(values) // 2
+    early = statistics.fmean(values[:half])
+    late = statistics.fmean(values[-half:])
+    return abs(late - early) / abs(middle) > 0.03
+
+
+def compare(
+    key: str, baseline: dict, observed: dict, tolerances: dict
+) -> tuple[list[str], list[str]]:
+    """Return regressions and improvements. A regression fails the run; an improvement does not.
+
+    An improvement is reported rather than swallowed, because a baseline nobody re-records drifts into a floor so low it stops catching anything.
+    """
+    failures: list[str] = []
+    gains: list[str] = []
+
+    for name, want in baseline.get("exact", {}).items():
+        got = observed.get("exact", {}).get(name)
+        if got != want:
+            failures.append(
+                f"{key}: {name} changed\n    baseline {want!r}\n    observed {got!r}"
+            )
+
+    for name, want in baseline.get("atmost", {}).items():
+        got = observed.get("atmost", {}).get(name)
+        ceiling = want + tolerances["absolute"]
+        if got is None:
+            failures.append(f"{key}: {name} missing from this run")
+        elif got > ceiling:
+            failures.append(
+                f"{key}: {name} rose to {got:.4f} (baseline {want:.4f}, ceiling {ceiling:.4f})"
+            )
+        elif got < want:
+            gains.append(f"{key}: {name} fell to {got:.4f} from {want:.4f}")
+
+    for name, want in baseline.get("loose", {}).items():
+        got = observed.get("loose", {}).get(name)
+        if got is None:
+            failures.append(f"{key}: {name} missing from this run")
+        elif want and abs(got - want) / want > tolerances["loose"]:
+            failures.append(
+                f"{key}: {name} moved {(got - want) / want:+.2%} "
+                f"(baseline {want:.6g}, observed {got:.6g}, allowed +-{tolerances['loose']:.1%})"
+            )
+
+    for name, want in baseline.get("speed", {}).items():
+        got = observed.get("speed", {}).get(name)
+        if got is None:
+            failures.append(f"{key}: {name} missing from this run")
+            continue
+        allowed = speed_tolerance_for(baseline, name, tolerances)
+        # Latency must not grow; a rate must not shrink.
+        regression = (got - want) / want if "latency" in name else (want - got) / want
+        if regression > allowed:
+            failures.append(
+                f"{key}: {name} regressed {regression:.2%} "
+                f"(baseline {want:.6g}, observed {got:.6g}, allowed {allowed:.1%})"
+            )
+        elif -regression > allowed:
+            gains.append(
+                f"{key}: {name} improved {-regression:.2%} "
+                f"(baseline {want:.6g}, observed {got:.6g})"
+            )
+    return failures, gains
+
+
+def speed_tolerance_for(baseline: dict, name: str, tolerances: dict) -> float:
+    """How far this field may move, derived from how much it wobbled when it was recorded.
+
+    One tolerance for every model is wrong in both directions at once. Measured on a B60 in one sweep, Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent: a shared 10 percent floor lets a 5 percent ASR regression through and still flares on Whisper's noise. The floor stays as the lower bound for a model quiet enough that three times its spread is tiny.
+    """
+    spread = baseline.get("spread", {}).get(f"speed.{name}")
+    if spread is None:
+        return tolerances["speed"]
+    return max(tolerances["speed"], spread * tolerances["speed_headroom"])
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument(
+        "--models",
+        default="all",
+        help="comma-separated keys, or 'all'",
+    )
+    parser.add_argument("--baseline", type=Path, default=DEFAULT_BASELINE)
+    parser.add_argument(
+        "--record",
+        action="store_true",
+        help="write this environment's entry instead of checking",
+    )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="report observed spread and exit without checking",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=5,
+        help="scored samples per model, taken after the warmups",
+    )
+    # One was not enough: on a 160 GiB card the first scored ASR sample sat 12.7 percent
+    # above the ninth while the rest spanned 2 percent, so a lone trailing-warm sample set
+    # the whole spread.
+    parser.add_argument(
+        "--warmups",
+        type=int,
+        default=2,
+        help="samples taken and discarded before scoring begins",
+    )
+    parser.add_argument(
+        "--fresh",
+        action="store_true",
+        help="re-measure models already recorded for this environment instead of resuming",
+    )
+    parser.add_argument(
+        "--card-pool",
+        default="0,1,2,3,4,5,6,7",
+        help="cards this run may claim; each model takes what its topology needs",
+    )
+    parser.add_argument(
+        "--loose-tolerance",
+        type=float,
+        default=0.60,
+        help="relative band for unpinnable audio fields",
+    )
+    parser.add_argument(
+        "--absolute-tolerance",
+        type=float,
+        default=0.05,
+        help="absolute headroom for a rate such as WER",
+    )
+    # A floor, not the usual gate: the per-field value is three times the recorded spread
+    # once that is larger. Kept low on purpose, so a quiet model gets a tight gate rather
+    # than inheriting the noisiest model's allowance.
+    parser.add_argument(
+        "--speed-tolerance",
+        type=float,
+        default=0.03,
+        help="lower bound on the speed regression allowed, before per-field spread is considered",
+    )
+    parser.add_argument(
+        "--speed-headroom",
+        type=float,
+        default=3.0,
+        help="multiple of a field's recorded spread to allow; the larger of this and the floor wins",
+    )
+    # A driver bug on one host must not change what another host measures, so the
+    # workaround lives in the invocation and is recorded in that host's entry.
+    parser.add_argument(
+        "--serve-extra",
+        action="append",
+        default=[],
+        metavar="KEY=ARGS",
+        help="extra serve args for one model on this host, e.g. qwen3-tts=--vocoder.factory.async_decode false",
+    )
+    parser.add_argument("--list", action="store_true")
+    args = parser.parse_args()
+
+    if args.list:
+        print(f"{'key':22s} {'cards':>5s} {'judge':10s} {'verified':9s} model")
+        for model in MODELS:
+            mark = (
+                "skip" if model.unservable else ("yes" if model.verified else "recipe")
+            )
+            print(
+                f"{model.key:22s} {model.cards:5d} {model.judge or '-':10s} {mark:9s} {model.model_path}"
+            )
+        return 0
+
+    keys = (
+        [model.key for model in MODELS]
+        if args.models == "all"
+        else args.models.split(",")
+    )
+    unknown = [key for key in keys if key not in MODEL_BY_KEY]
+    if unknown:
+        parser.error(f"unknown model keys: {unknown}; see --list")
+
+    extras: dict[str, tuple[str, ...]] = {}
+    for item in args.serve_extra:
+        key, _, argument_text = item.partition("=")
+        if key not in MODEL_BY_KEY or not argument_text:
+            parser.error(f"--serve-extra wants <model key>=<args>, got {item!r}")
+        extras[key] = tuple(argument_text.split())
+
+    pool = [int(c) for c in args.card_pool.split(",") if c.strip()]
+    fingerprint = environment_fingerprint(args.card_pool)
+    env_key = fingerprint_key(fingerprint)
+    print(f"environment {env_key}: {json.dumps(fingerprint)}")
+
+    stored = {"environments": {}}
+    if args.baseline.exists():
+        stored = json.loads(args.baseline.read_text())
+    entry = stored.get("environments", {}).get(env_key, {})
+
+    if not args.record and not args.calibrate and not entry:
+        known = stored.get("environments", {})
+        print(
+            f"no baseline for environment {env_key} in {args.baseline}.\n"
+            f"  known environments: {[e.get('fingerprint', {}).get('host') for e in known.values()] or 'none'}\n"
+            "  run with --record to add this one.",
+            file=sys.stderr,
+        )
+        return 2
+
+    tolerances = {
+        "loose": args.loose_tolerance,
+        "absolute": args.absolute_tolerance,
+        "speed": args.speed_tolerance,
+        "speed_headroom": args.speed_headroom,
+    }
+
+    def flush(partial: dict[str, Any]) -> None:
+        """Persist what is measured so far, so an interrupted sweep resumes instead of restarting."""
+        stored.setdefault("environments", {})[env_key] = {
+            "fingerprint": fingerprint,
+            "recorded_from_commit": recorded_from_commit(),
+            "tolerances": tolerances,
+            # Merged like models: a later single-model record must not erase another
+            # model's recorded workaround, or the file claims it was measured with
+            # defaults that do not work.
+            "serve_extra": {
+                **entry.get("serve_extra", {}),
+                **{key: list(value) for key, value in extras.items()},
+            },
+            "models": {**entry.get("models", {}), **partial},
+        }
+        args.baseline.write_text(json.dumps(stored, indent=2, sort_keys=True) + "\n")
+
+    results: dict[str, Any] = {}
+    failures: list[str] = []
+    gains: list[str] = []
+    skipped: list[str] = []
+    done = entry.get("models", {}) if args.record and not args.fresh else {}
+    for index, key in enumerate(keys, start=1):
+        model = MODEL_BY_KEY[key]
+        print(f"\n== [{index}/{len(keys)}] {model.name} ({key}) ==", flush=True)
+        if model.unservable:
+            print(f"  SKIPPED: {model.unservable}", flush=True)
+            skipped.append(f"{key}: {model.unservable}")
+            continue
+        if key in done:
+            print(
+                "  already recorded for this environment; --fresh to redo", flush=True
+            )
+            skipped.append(f"{key}: already recorded")
+            continue
+        # A topology the pool cannot host is absent, not broken: a four-card host skips the
+        # TP=8 entry rather than reporting it as a failure.
+        if model.cards > len(pool):
+            reason = f"needs {model.cards} cards, pool has {len(pool)}"
+            print(f"  SKIPPED: {reason}", flush=True)
+            skipped.append(f"{key}: {reason}")
+            continue
+        try:
+            observed = measure(model, pool, args.repeats, args.warmups, extras)
+        except Exception as exc:
+            failures.append(f"{key}: did not produce a measurement: {exc}")
+            print(f"  FAILED: {exc}", flush=True)
+            print(
+                f"  running tally: {len(results)} ok, {len(failures)} failed, {len(skipped)} skipped",
+                flush=True,
+            )
+            continue
+        results[key] = observed
+        if args.record:
+            flush(results)
+        speed = observed.get("speed") or observed.get("speed_informational", {})
+        note = "" if "speed" in observed else "  (informational, not gated)"
+        print(f"  median  {json.dumps(speed)}{note}")
+        print(
+            f"  accuracy {json.dumps(observed['exact'])} {json.dumps(observed.get('atmost', {}))}"
+        )
+        print(f"  spread  {json.dumps(observed['spread'])}")
+        if not args.record and not args.calibrate:
+            if key not in entry.get("models", {}):
+                failures.append(
+                    f"{key}: absent from this environment's baseline; re-record to add it"
+                )
+            else:
+                model_failures, model_gains = compare(
+                    key, entry["models"][key], observed, tolerances
+                )
+                failures += model_failures
+                gains += model_gains
+                for message in model_gains:
+                    print(f"  IMPROVED {message.split(': ', 1)[1]}", flush=True)
+        print(
+            f"  running tally: {len(results)} ok, {len(failures)} failed, {len(skipped)} skipped",
+            flush=True,
+        )
+
+    if args.record:
+        flush(results)
+        print(
+            f"\nwrote {len(results)} model(s) for environment {env_key} to {args.baseline}"
+        )
+        return 1 if failures else 0
+
+    if args.calibrate:
+        print("\nobserved spread per field, as a fraction of the median:")
+        for key, observed in results.items():
+            for name, span in sorted(observed["spread"].items()):
+                print(f"  {key:22s} {name:46s} {span:.2%}")
+        print(
+            "\nSet --speed-tolerance above the largest speed spread, or the gate will be flaky."
+        )
+        return 0
+
+    print()
+    for message in failures:
+        print(f"REGRESSION  {message}")
+    for message in gains:
+        print(f"IMPROVED    {message}")
+    if gains:
+        print(
+            "  these beat the baseline: re-record so the floor rises with the code, "
+            "or the gate stops catching anything."
+        )
+    for message in skipped:
+        print(f"SKIPPED     {message}")
+    print(
+        f"{len(results)} measured, {len(skipped)} skipped, {len(failures)} regression(s)"
+    )
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
