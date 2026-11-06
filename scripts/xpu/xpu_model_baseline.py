@@ -19,6 +19,8 @@ Speed is the median of repeated samples after two discarded warmups, at concurre
 
 A speed field is allowed the larger of a floor and three times the spread it showed when it was recorded, because one tolerance for every model is wrong in both directions at once: in one B60 sweep Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent, so a shared 10 percent would let a 5 percent ASR regression through while still flaring on Whisper.
 
+That spread is the trimmed one, with the best and worst sample dropped, while the full range is reported beside it. A single stalled sample is a real event worth seeing and a bad description of a model's dispersion: nine Nemotron 3.5 ASR samples sat inside nine percent except one, and sizing on the full range would have handed that entry a 201 percent tolerance -- wide enough to miss a doubling.
+
 With --launches above 1 the speed figure is the slowest launch rather than the median of them. These models turn out to be modal, not noisy, and the slow mode is the only anchor a gate can hold without firing on a clean run.
 
 Baselines are per environment. The file holds one entry per host, card model, cards and torch/sglang version, and a check against an environment the file has never seen stops rather than comparing numbers that were never comparable.
@@ -1033,11 +1035,23 @@ def fold_samples(samples: list[dict]) -> dict:
             if len(values) > 1 and folded[group][key]:
                 span = (max(values) - min(values)) / folded[group][key]
                 folded["spread"][f"{group}.{key}"] = round(span, 4)
-                if group == "speed" and still_warming(values):
-                    print(
-                        f"    still warming on {key}: samples move one way across the whole run "
-                        f"({values[0]:.6g} to {values[-1]:.6g}); raise --warmups before trusting the spread"
-                    )
+                trimmed = trimmed_span(values, folded[group][key])
+                if group == "speed" and trimmed is not None:
+                    folded.setdefault("trimmed_spread", {})[f"{group}.{key}"] = trimmed
+                else:
+                    pass
+                if group == "speed":
+                    drift = warming_drift(values)
+                    if drift:
+                        early, late = drift
+                        print(
+                            f"    still warming on {key}: the run's two halves sit apart "
+                            f"({early:.6g} then {late:.6g}); raise --warmups before trusting the spread"
+                        )
+                    else:
+                        pass
+                else:
+                    pass
     # Measured but deliberately not gated, so it has to be carried here explicitly:
     # the loop above only walks the compared groups, which would drop it.
     if samples[0].get("observed"):
@@ -1053,20 +1067,36 @@ def fold_samples(samples: list[dict]) -> dict:
     return folded
 
 
-def still_warming(values: list[float]) -> bool:
-    """True when the first half of the scored run sits apart from the second, which is a warmup curve rather than noise.
+def trimmed_span(values: list[float], middle: float) -> float | None:
+    """Spread with the best and worst sample dropped, or None when there are too few to drop any.
+
+    What a gate should be sized from. Nemotron 3.5 ASR ran nine samples on a B60 at 0.1399, 0.1393, 0.1399, 0.2333, 0.1636, 0.1476, 0.1431, 0.1446, 0.1372: eight of them inside nine percent, and one stall. Sizing on the full range calls that model 67 percent noisy and, at three times headroom, hands it a 201 percent tolerance that would miss a doubling. The stall is real and still shows in the reported spread -- it is just not the typical dispersion, and the typical dispersion is what a tolerance describes.
+    """
+    if len(values) < 5:
+        return None
+    else:
+        inner = sorted(values)[1:-1]
+        return round((max(inner) - min(inner)) / middle, 4)
+
+
+def warming_drift(values: list[float]) -> tuple[float, float] | None:
+    """The two half-medians when the run is still settling, else None.
 
     Comparing halves rather than checking monotonicity: a settling server ties or ticks the wrong way once, and either defeats a per-sample test while the drift is still there. Whisper on a B60 ran 0.4451, 0.4472, 0.4421, 0.4339, 0.4105 -- down 7.8 percent overall, with rep 2 breaking the slope.
+
+    Halves are compared by median, not mean, because one stalled sample drags a mean into looking like drift: Nemotron 3.5 ASR tripped this with a single 0.2333 among eight samples near 0.14, and the warning then quoted the first and last sample, which were 2 percent apart and illustrated nothing.
     """
     if len(values) < 4:
-        return False
-    middle = statistics.median(values)
-    if not middle:
-        return False
-    half = len(values) // 2
-    early = statistics.fmean(values[:half])
-    late = statistics.fmean(values[-half:])
-    return abs(late - early) / abs(middle) > 0.03
+        return None
+    else:
+        middle = statistics.median(values)
+        half = len(values) // 2
+        early = statistics.median(values[:half])
+        late = statistics.median(values[-half:])
+        if middle and abs(late - early) / abs(middle) > 0.03:
+            return (early, late)
+        else:
+            return None
 
 
 def compare(
@@ -1142,10 +1172,19 @@ def speed_tolerance_for(baseline: dict, name: str, tolerances: dict) -> float:
 
     One tolerance for every model is wrong in both directions at once. Measured on a B60 in one sweep, Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent: a shared 10 percent floor lets a 5 percent ASR regression through and still flares on Whisper's noise. The floor stays as the lower bound for a model quiet enough that three times its spread is tiny.
     """
-    spread = baseline.get("spread", {}).get(f"speed.{name}")
+    # The trimmed spread when the entry has one: it describes the dispersion a tolerance
+    # is for, where the full range describes the worst sample seen and is reported
+    # separately. Falls back to the full range for entries recorded before trimming, and
+    # to the floor for a field with no spread at all.
+    spread = baseline.get("trimmed_spread", {}).get(f"speed.{name}")
+    if spread is None:
+        spread = baseline.get("spread", {}).get(f"speed.{name}")
+    else:
+        pass
     if spread is None:
         return tolerances["speed"]
-    return max(tolerances["speed"], spread * tolerances["speed_headroom"])
+    else:
+        return max(tolerances["speed"], spread * tolerances["speed_headroom"])
 
 
 def main() -> int:

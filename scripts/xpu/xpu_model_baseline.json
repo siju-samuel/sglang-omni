@@ -293,17 +293,30 @@
           "atmost": {
             "word_error_rate": 0.0
           },
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 196.0
+            },
+            "before": {
+              "0": 196.0
+            }
+          },
           "close": {},
           "exact": {
             "transcript": "how many cars are there in the picture"
           },
           "speed": {
-            "audio_seconds_per_wall_second": 29.974954951513283,
-            "latency_s": 0.15412867200211622
+            "audio_seconds_per_wall_second": 31.18033207590934,
+            "latency_s": 0.14817032701103017
           },
           "spread": {
-            "speed.audio_seconds_per_wall_second": 0.4575,
-            "speed.latency_s": 0.785
+            "speed.audio_seconds_per_wall_second": 0.0372,
+            "speed.latency_s": 0.0373
+          },
+          "trimmed_spread": {
+            "speed.audio_seconds_per_wall_second": 0.0181,
+            "speed.latency_s": 0.0182
           }
         },
         "qwen3-asr": {
@@ -457,7 +470,7 @@
           }
         }
       },
-      "recorded_from_commit": "3f9512d8d",
+      "recorded_from_commit": "82eec4328",
       "serve_extra": {},
       "tolerances": {
         "absolute": 0.05,
