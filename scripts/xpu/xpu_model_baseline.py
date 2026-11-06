@@ -258,6 +258,20 @@ MODELS: tuple[XpuModel, ...] = (
         cards=8,
         config_variant="text",
         serve_args=(
+            # The guide's recipe no longer starts: an XPU-only reserve added in sglang
+            # 0.5.20 walks the auto fraction down to 0.302, and the loader then refuses
+            # with "Loaded weights leave no GPU memory for the KV cache ... raise above
+            # 0.304". 0.435 is what the auto path resolved to before that reserve.
+            "--thinker.engine.mem_fraction_static",
+            "0.435",
+            # The XPU platform hands the vision encoder sgl-kernel's joint RoPE
+            # unconditionally, and that kernel only compiles for rope_dim in
+            # [64, 80, 96, 128, 256, 512]. This encoder's head dim is 1152/16 = 72, so
+            # the server's own warmup request dies with "Unsupported rope_dim for XPU
+            # RoPE: 72" once all eight ranks have loaded. --text-only still builds the
+            # encoder, so the only way to a text baseline is to not send that request.
+            # Drop this once the platform checks the dim before claiming the kernel.
+            "--skip-server-warmup",
             "--text-only",
             "--thinker.process",
             "thinker",
