@@ -931,7 +931,19 @@ def measure_launches(
         return runs[0]
     folded = fold_samples(runs)
     folded["speed"] = pessimistic_speed(runs)
-    folded["within_run_spread"] = runs[0].get("spread", {})
+    # The worst within-run dispersion any launch showed, not the first launch's: this is
+    # what the tolerance is derived from once the recorded value is the slowest launch,
+    # so it should be the least favourable one observed rather than whichever ran first.
+    #
+    # Each launch's trimmed figure, for the same reason the single-launch path trims: one
+    # of these three launches stalled once, and its full range of 77 percent would have
+    # set a 230 percent tolerance -- worse than the double-count this replaced.
+    worst_within: dict[str, float] = {}
+    for run in runs:
+        per_run = run.get("trimmed_spread") or run.get("spread", {})
+        for name, value in per_run.items():
+            worst_within[name] = max(worst_within.get(name, 0.0), value)
+    folded["within_run_spread"] = worst_within
     folded["launches"] = launches
     return folded
 
@@ -1172,11 +1184,20 @@ def speed_tolerance_for(baseline: dict, name: str, tolerances: dict) -> float:
 
     One tolerance for every model is wrong in both directions at once. Measured on a B60 in one sweep, Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent: a shared 10 percent floor lets a 5 percent ASR regression through and still flares on Whisper's noise. The floor stays as the lower bound for a model quiet enough that three times its spread is tiny.
     """
-    # The trimmed spread when the entry has one: it describes the dispersion a tolerance
-    # is for, where the full range describes the worst sample seen and is reported
-    # separately. Falls back to the full range for entries recorded before trimming, and
-    # to the floor for a field with no spread at all.
-    spread = baseline.get("trimmed_spread", {}).get(f"speed.{name}")
+    # A multi-launch entry already holds its slowest launch, so its launch-to-launch
+    # spread is in the recorded value and must not be charged again as tolerance: that
+    # double-count gave Nemotron 3.5 ASR a 31.9% allowance on an anchor picked precisely
+    # so it would not need one. Such an entry derives from the worst within-run
+    # dispersion instead, which is the noise left once the mode is pinned.
+    #
+    # Otherwise the trimmed spread, which describes the dispersion a tolerance is for,
+    # where the full range describes the worst sample seen and is reported beside it.
+    # Falls back to the full range for entries recorded before trimming, and to the floor
+    # for a field with no spread at all.
+    if baseline.get("launches", 1) > 1:
+        spread = baseline.get("within_run_spread", {}).get(f"speed.{name}")
+    else:
+        spread = baseline.get("trimmed_spread", {}).get(f"speed.{name}")
     if spread is None:
         spread = baseline.get("spread", {}).get(f"speed.{name}")
     else:
