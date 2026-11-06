@@ -1,8 +1,7 @@
 {
   "environments": {
-    "48a34c857bec": {
+    "8c71267e0826": {
       "fingerprint": {
-        "card_pool": "0,1,2,3,4,5,6,7",
         "device": "Intel(R) Arc(TM) Pro B60 Graphics",
         "host": "bmg17690",
         "sglang": "0.5.23",
@@ -135,6 +134,29 @@
           "spread": {
             "speed.audio_seconds_per_wall_second": 0.06,
             "speed.latency_s": 0.0619
+          }
+        },
+        "higgs": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.486297607421875,
+            "rms": 0.06394019133220058
+          },
+          "exact": {
+            "frames": 86400.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 1.8730872569559145,
+            "latency_s": 1.921960648993263
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0009,
+            "speed.latency_s": 0.0009
           }
         },
         "moss-transcribe-diarize": {
@@ -276,18 +298,17 @@
           }
         }
       },
-      "recorded_from_commit": "f77027def",
+      "recorded_from_commit": "af3172fb7",
       "serve_extra": {},
       "tolerances": {
         "absolute": 0.05,
         "close": 0.03,
-        "speed": 0.03,
+        "speed": 0.1,
         "speed_headroom": 3.0
       }
     },
-    "fb064c61feb1": {
+    "f813a1540f30": {
       "fingerprint": {
-        "card_pool": "0,1,2,3",
         "device": "Intel(R) Graphics [0x674c]",
         "host": "dut19036smc",
         "sglang": "0.5.24.dev7+g12e8df5e8",

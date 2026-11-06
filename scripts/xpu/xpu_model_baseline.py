@@ -96,6 +96,9 @@ class XpuModel:
     # drops the talker, and aiming a determinism override at a stage the chosen pipeline
     # does not have is rejected at engine build.
     config_variant: str = ""
+    # ZONOS2 rejects a seed outright: its sampling uses the shared device RNG. Without one
+    # the generated length is not reproducible, so the frame count cannot be held exact.
+    seedless: bool = False
     payload: dict[str, Any] = field(default_factory=dict)
     # Extra process environment the guide's recipe calls for.
     env: dict[str, str] = field(default_factory=dict)
@@ -109,27 +112,30 @@ class XpuModel:
 MODELS: tuple[XpuModel, ...] = (
     XpuModel(
         key="qwen3-asr",
+        verified=True,
         name="Qwen3-ASR",
         model_path="Qwen/Qwen3-ASR-1.7B",
         probe="transcription",
         # The metadata glue graph is CUDA-only and leaves ASR without a transcript on main.
         env={"SGLANG_ENABLE_METADATA_GLUE_GRAPH": "0"},
-        verified=True,
     ),
     XpuModel(
         key="whisper",
+        verified=True,
         name="Whisper large-v3",
         model_path="openai/whisper-large-v3",
         probe="transcription",
     ),
     XpuModel(
         key="fun-asr",
+        verified=True,
         name="Fun-ASR-Nano",
         model_path="FunAudioLLM/Fun-ASR-Nano-2512-hf",
         probe="transcription",
     ),
     XpuModel(
         key="qwen3-tts",
+        verified=True,
         name="Qwen3-TTS Base",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         probe="speech",
@@ -139,10 +145,10 @@ MODELS: tuple[XpuModel, ...] = (
             "ref_text": REFERENCE_TEXT,
         },
         judge="qwen3-asr",
-        verified=True,
     ),
     XpuModel(
         key="qwen3-tts-cv",
+        verified=True,
         name="Qwen3-TTS CustomVoice",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         probe="speech",
@@ -154,6 +160,7 @@ MODELS: tuple[XpuModel, ...] = (
         name="Fun-CosyVoice3",
         model_path="FunAudioLLM/Fun-CosyVoice3-0.5B-2512",
         probe="speech",
+        unservable="needs the fun-cosyvoice3 extra; module cosyvoice is absent",
         payload={
             "voice": "default",
             "ref_audio": str(REFERENCE_AUDIO),
@@ -166,11 +173,14 @@ MODELS: tuple[XpuModel, ...] = (
         name="ZONOS2",
         model_path="Zyphra/zonos2",
         probe="speech",
+        seedless=True,
+        unservable="needs the dac codec module, which this install does not have",
         payload={"voice": "default"},
         judge="qwen3-asr",
     ),
     XpuModel(
         key="dots-tts",
+        verified=True,
         name="dots.tts SOAR",
         model_path="dots-studio/dots.tts-soar",
         probe="speech",
@@ -235,6 +245,7 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="moss-transcribe-diarize",
+        verified=True,
         name="MOSS-Transcribe-Diarize",
         model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
         probe="transcription",
@@ -254,27 +265,33 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="nemotron35-asr",
+        verified=True,
         name="Nemotron 3.5 ASR",
         model_path="nvidia/nemotron-3.5-asr-streaming-0.6b",
         probe="transcription",
     ),
     XpuModel(
         key="arkasr",
+        verified=True,
         name="ARK-ASR",
         model_path="AutoArk-AI/ARK-ASR-3B",
         probe="transcription",
     ),
     XpuModel(
         key="higgs",
+        verified=True,
         name="Higgs Audio v3 TTS",
         model_path="bosonai/higgs-audio-v3-tts-4b",
         probe="speech",
         serve_args=("--allowed-local-media-path", "docs/_static/audio"),
         payload={"voice": "default"},
         judge="qwen3-asr",
+        # 8.7 GB of weights: a cold pull does not finish inside the default window.
+        startup_seconds=2400,
     ),
     XpuModel(
         key="auk",
+        verified=True,
         name="AuK",
         model_path="tencent/AuK",
         probe="speech",
@@ -288,6 +305,7 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="auk-flash",
+        verified=True,
         name="AuK-Flash",
         model_path="tencent/AuK-Flash",
         probe="speech",
@@ -300,6 +318,7 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="qwen3-tts-vd",
+        verified=True,
         name="Qwen3-TTS VoiceDesign",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         probe="speech",
@@ -313,6 +332,7 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="dots-tts-base",
+        verified=True,
         name="dots.tts Base",
         model_path="dots-studio/dots.tts-base",
         probe="speech",
@@ -395,8 +415,11 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / len(want)
 
 
-def environment_fingerprint(card_pool: str) -> dict[str, str]:
-    """Identify the machine a baseline belongs to, so numbers are never compared across hosts."""
+def environment_fingerprint() -> dict[str, str]:
+    """Identify the machine a baseline belongs to, so numbers are never compared across hosts.
+
+    Deliberately not the card pool: that is a run option, and keying on it forked the environment whenever a subset was measured with --card-pool. Which cards a model actually ran on is recorded with the model instead, and a later run on different cards says so.
+    """
     import torch
 
     device = "unknown"
@@ -413,7 +436,6 @@ def environment_fingerprint(card_pool: str) -> dict[str, str]:
     return {
         "host": socket.gethostname(),
         "device": device,
-        "card_pool": card_pool,
         "torch": torch.__version__,
         "sglang": sglang_version,
     }
@@ -519,9 +541,7 @@ def synthesize(
         "model": model.model_path,
         "input": text,
         "response_format": "wav",
-        # CreateSpeechRequest takes a seed; whether a given model honours it is the
-        # question the frame count answers.
-        "seed": 0,
+        **({} if model.seedless else {"seed": 0}),
         **model.payload,
     }
     started = time.perf_counter()
@@ -538,7 +558,7 @@ def probe_speech(base_url: str, model: XpuModel, judge_url: str) -> dict:
         # Seeded, Qwen3-TTS repeated frames and loudness exactly across six reps, so the
         # frame count is held exact. Loudness still gets a band: the token stream is
         # reproducible but a kernel change moves the vocoder's floats.
-        "exact": {"sample_rate": shape["sample_rate"], "frames": shape["frames"]},
+        "exact": {"sample_rate": shape["sample_rate"]},
         "atmost": {},
         "close": {"peak": shape["peak"], "rms": shape["rms"]},
         "speed": {
@@ -546,6 +566,12 @@ def probe_speech(base_url: str, model: XpuModel, judge_url: str) -> dict:
             "audio_seconds_per_wall_second": shape["audio_seconds"] / elapsed,
         },
     }
+    # Seeded, frames repeat exactly and belong with the text. Unseeded they follow the
+    # sampling, so they move to the band and only catch a truncated vocoder.
+    if model.seedless:
+        result["close"]["frames"] = shape["frames"]
+    else:
+        result["exact"]["frames"] = shape["frames"]
     if judge_url:
         heard = transcribe(
             judge_url, MODEL_BY_KEY[model.judge].model_path, audio, "tts.wav"
@@ -777,7 +803,9 @@ def measure(
         for proc in reversed(servers):
             stop_server(proc)
 
-    return fold_samples(samples[warmups:])
+    folded = fold_samples(samples[warmups:])
+    folded["cards"] = cards
+    return folded
 
 
 def fold_samples(samples: list[dict]) -> dict:
@@ -832,6 +860,14 @@ def compare(
     """
     failures: list[str] = []
     gains: list[str] = []
+
+    recorded_cards = baseline.get("cards")
+    observed_cards = observed.get("cards")
+    if recorded_cards and observed_cards and recorded_cards != observed_cards:
+        gains.append(
+            f"{key}: recorded on card(s) {recorded_cards}, measured on {observed_cards}; "
+            "speed is not comparable across cards on a host with uneven PCIe links"
+        )
 
     for name, want in baseline.get("exact", {}).items():
         got = observed.get("exact", {}).get(name)
@@ -1012,7 +1048,7 @@ def main() -> int:
         extras[key] = tuple(argument_text.split())
 
     pool = [int(c) for c in args.card_pool.split(",") if c.strip()]
-    fingerprint = environment_fingerprint(args.card_pool)
+    fingerprint = environment_fingerprint()
     env_key = fingerprint_key(fingerprint)
     print(f"environment {env_key}: {json.dumps(fingerprint)}")
 
@@ -1118,8 +1154,10 @@ def main() -> int:
             flush=True,
         )
 
-    if args.record:
+    if args.record and results:
         flush(results)
+    elif args.record:
+        print("nothing measured; leaving the baseline untouched")
         print(
             f"\nwrote {len(results)} model(s) for environment {env_key} to {args.baseline}"
         )
