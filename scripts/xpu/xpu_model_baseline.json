@@ -311,6 +311,66 @@
             "speed.latency_s": 0.0128
           }
         },
+        "dots-tts": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.452728271484375,
+            "rms": 0.06231127674451939
+          },
+          "exact": {
+            "frames": 330240.0,
+            "sample_rate": 48000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 1.044000434101232,
+            "latency_s": 6.5900355740013765
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0475,
+            "speed.latency_s": 0.0497
+          },
+          "within_run_spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0511,
+            "speed.latency_s": 0.049
+          }
+        },
+        "dots-tts-base": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.5284423828125,
+            "rms": 0.07885969718851331
+          },
+          "exact": {
+            "frames": 253440.0,
+            "sample_rate": 48000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 1.091589375948139,
+            "latency_s": 4.836983683002472
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0056,
+            "speed.latency_s": 0.0056
+          },
+          "within_run_spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0298,
+            "speed.latency_s": 0.03
+          }
+        },
         "fun-asr": {
           "atmost": {
             "word_error_rate": 0.0
@@ -380,6 +440,96 @@
             "speed.latency_s": 0.0084
           }
         },
+        "qwen3-tts": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.515594482421875,
+            "rms": 0.055809785844245535
+          },
+          "exact": {
+            "frames": 92160.0,
+            "sample_rate": 24000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 1.4963751819280087,
+            "latency_s": 2.566201342000568
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0246,
+            "speed.latency_s": 0.0245
+          },
+          "within_run_spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0049,
+            "speed.latency_s": 0.0049
+          }
+        },
+        "qwen3-tts-cv": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.499969482421875,
+            "rms": 0.08471720788687216
+          },
+          "exact": {
+            "frames": 90240.0,
+            "sample_rate": 24000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 1.5193004359156235,
+            "latency_s": 2.4748232220008504
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0023,
+            "speed.latency_s": 0.0023
+          },
+          "within_run_spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0101,
+            "speed.latency_s": 0.0102
+          }
+        },
+        "qwen3-tts-vd": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.695281982421875,
+            "rms": 0.1170150640091418
+          },
+          "exact": {
+            "frames": 61440.0,
+            "sample_rate": 24000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 1.4979455825569137,
+            "latency_s": 1.7090073429972108
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0153,
+            "speed.latency_s": 0.0151
+          },
+          "within_run_spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0031,
+            "speed.latency_s": 0.0031
+          }
+        },
         "whisper": {
           "atmost": {
             "word_error_rate": 0.0
@@ -399,10 +549,23 @@
         }
       },
       "recorded_from_commit": "55d672a1",
-      "serve_extra": {},
+      "serve_extra": {
+        "qwen3-tts": [
+          "--tts_engine.engine.disable_cuda_graph",
+          "true"
+        ],
+        "qwen3-tts-cv": [
+          "--tts_engine.engine.disable_cuda_graph",
+          "true"
+        ],
+        "qwen3-tts-vd": [
+          "--tts_engine.engine.disable_cuda_graph",
+          "true"
+        ]
+      },
       "tolerances": {
         "absolute": 0.05,
-        "loose": 0.6,
+        "close": 0.03,
         "speed": 0.15,
         "speed_headroom": 3.0
       }

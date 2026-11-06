@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -102,12 +103,20 @@ def free_gib() -> float:
 
 
 def recorded_keys() -> set[str]:
+    """Models already recorded for THIS host.
+
+    Scoped by hostname rather than reading every environment: the file is shared with other
+    hosts' entries, and counting theirs as done makes this driver skip models it has never
+    measured here.
+    """
     if not BASELINE.exists():
         return set()
     stored = json.loads(BASELINE.read_text())
+    host = socket.gethostname()
     keys: set[str] = set()
     for entry in stored.get("environments", {}).values():
-        keys.update(entry.get("models", {}))
+        if entry.get("fingerprint", {}).get("host") == host:
+            keys.update(entry.get("models", {}))
     return keys
 
 
@@ -202,7 +211,7 @@ def wait_for_idle_cards(count: int, ceiling_mib: float, wait_s: int) -> tuple[bo
         print(f"  waiting for {', '.join(busy)} to go quiet", flush=True)
         time.sleep(30)
 
-def run_one(key: str, repeats: int, tolerance: float, fresh: bool) -> tuple[bool, str]:
+def run_one(key: str, repeats: int, tolerance: float, fresh: bool, launches: int) -> tuple[bool, str]:
     log = WORK / f"sweep_{key}.log"
     command = [
         sys.executable,
@@ -223,6 +232,8 @@ def run_one(key: str, repeats: int, tolerance: float, fresh: bool) -> tuple[bool
         command += ["--serve-extra", f"{key}={SERVE_EXTRA[key]}"]
     if fresh:
         command += ["--fresh"]
+    if launches > 1:
+        command += ["--launches", str(launches)]
     env = dict(os.environ, PYTHONPATH=str(REPO))
     with log.open("w") as handle:
         completed = subprocess.run(
@@ -240,6 +251,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--speed-tolerance", type=float, default=0.15)
     parser.add_argument("--only", default="", help="comma-separated subset of keys")
+    parser.add_argument(
+        "--launches",
+        type=int,
+        default=1,
+        help="server restarts per model; >1 anchors the record at the slowest launch",
+    )
     parser.add_argument(
         "--fresh",
         action="store_true",
@@ -330,7 +347,7 @@ def main() -> int:
             write_ledger(ledger)
             continue
         started = time.time()
-        ok, detail = run_one(key, args.repeats, args.speed_tolerance, args.fresh)
+        ok, detail = run_one(key, args.repeats, args.speed_tolerance, args.fresh, args.launches)
         elapsed = time.time() - started
         after = cards_in_use(cards_needed)
         if after and max(after) > args.idle_ceiling_mib:
