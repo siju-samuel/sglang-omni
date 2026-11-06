@@ -242,6 +242,35 @@
             "speed.latency_s": 0.005
           }
         },
+        "minimax-music3": {
+          "atmost": {},
+          "cards": "0,1",
+          "cards_used_mib": {
+            "after": {
+              "0": 196.0,
+              "1": 25.4
+            },
+            "before": {
+              "0": 196.0,
+              "1": 25.4
+            }
+          },
+          "close": {
+            "audio_seconds": 18.49471875,
+            "rms": 0.11197205427841772
+          },
+          "exact": {
+            "sample_rate": 32000.0
+          },
+          "speed": {
+            "latency_s": 367.3029849650047
+          },
+          "spread": {
+            "close.audio_seconds": 0.0,
+            "close.rms": 0.0,
+            "speed.latency_s": 0.0001
+          }
+        },
         "moss-transcribe-diarize": {
           "atmost": {
             "word_error_rate": 0.25
@@ -390,7 +419,7 @@
           }
         }
       },
-      "recorded_from_commit": "7c8ece43a",
+      "recorded_from_commit": "1e765f6fd",
       "serve_extra": {},
       "tolerances": {
         "absolute": 0.05,

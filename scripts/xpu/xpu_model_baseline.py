@@ -199,7 +199,18 @@ MODELS: tuple[XpuModel, ...] = (
         model_path="MiniMaxAI/MiniMax-Music3",
         probe="music",
         cards=2,
-        serve_args=("--mem-fraction-static", "0.7"),
+        # The AR stage picks fa3 on XPU and asserts "requires SM>=80 and SM<=90":
+        # handle_xpu_backends in sglang's platform_hook sets the sampling backend and
+        # the decode graph but never an attention backend, unlike the CPU and HPU hooks
+        # beside it, and this model has no hook of its own to land on triton the way
+        # every other XPU stage here does. The cookbook's own bare command fails the
+        # same way; drop this once the XPU hook picks a default.
+        serve_args=(
+            "--mem-fraction-static",
+            "0.7",
+            "--minimax_music3_ar.engine.attention_backend",
+            "triton",
+        ),
         # Music takes a style prompt, not a voice, and an explicit token cap: the default
         # length makes the run unbounded and not comparable between sweeps.
         payload={
