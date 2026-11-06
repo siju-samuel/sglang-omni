@@ -112,30 +112,27 @@ class XpuModel:
 MODELS: tuple[XpuModel, ...] = (
     XpuModel(
         key="qwen3-asr",
-        verified=True,
         name="Qwen3-ASR",
         model_path="Qwen/Qwen3-ASR-1.7B",
         probe="transcription",
         # The metadata glue graph is CUDA-only and leaves ASR without a transcript on main.
         env={"SGLANG_ENABLE_METADATA_GLUE_GRAPH": "0"},
+        verified=True,
     ),
     XpuModel(
         key="whisper",
-        verified=True,
         name="Whisper large-v3",
         model_path="openai/whisper-large-v3",
         probe="transcription",
     ),
     XpuModel(
         key="fun-asr",
-        verified=True,
         name="Fun-ASR-Nano",
         model_path="FunAudioLLM/Fun-ASR-Nano-2512-hf",
         probe="transcription",
     ),
     XpuModel(
         key="qwen3-tts",
-        verified=True,
         name="Qwen3-TTS Base",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         probe="speech",
@@ -145,10 +142,10 @@ MODELS: tuple[XpuModel, ...] = (
             "ref_text": REFERENCE_TEXT,
         },
         judge="qwen3-asr",
+        verified=True,
     ),
     XpuModel(
         key="qwen3-tts-cv",
-        verified=True,
         name="Qwen3-TTS CustomVoice",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         probe="speech",
@@ -180,7 +177,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="dots-tts",
-        verified=True,
         name="dots.tts SOAR",
         model_path="dots-studio/dots.tts-soar",
         probe="speech",
@@ -245,7 +241,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="moss-transcribe-diarize",
-        verified=True,
         name="MOSS-Transcribe-Diarize",
         model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
         probe="transcription",
@@ -265,21 +260,18 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="nemotron35-asr",
-        verified=True,
         name="Nemotron 3.5 ASR",
         model_path="nvidia/nemotron-3.5-asr-streaming-0.6b",
         probe="transcription",
     ),
     XpuModel(
         key="arkasr",
-        verified=True,
         name="ARK-ASR",
         model_path="AutoArk-AI/ARK-ASR-3B",
         probe="transcription",
     ),
     XpuModel(
         key="higgs",
-        verified=True,
         name="Higgs Audio v3 TTS",
         model_path="bosonai/higgs-audio-v3-tts-4b",
         probe="speech",
@@ -291,7 +283,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="auk",
-        verified=True,
         name="AuK",
         model_path="tencent/AuK",
         probe="speech",
@@ -305,7 +296,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="auk-flash",
-        verified=True,
         name="AuK-Flash",
         model_path="tencent/AuK-Flash",
         probe="speech",
@@ -318,7 +308,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="qwen3-tts-vd",
-        verified=True,
         name="Qwen3-TTS VoiceDesign",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
         probe="speech",
@@ -332,7 +321,6 @@ MODELS: tuple[XpuModel, ...] = (
     ),
     XpuModel(
         key="dots-tts-base",
-        verified=True,
         name="dots.tts Base",
         model_path="dots-studio/dots.tts-base",
         probe="speech",
@@ -700,6 +688,30 @@ def launch(model: XpuModel, cards: str, extra: tuple[str, ...] = ()) -> tuple[An
     return proc, f"http://127.0.0.1:{port}"
 
 
+class CardsBusy(RuntimeError):
+    """Raised instead of measuring when something else already holds the card.
+
+    Its own type so a check can tell "could not measure" from "measured and it regressed". Contention reported as a regression is how a gate learns to be ignored: one shared host had a check claim 575 percent on a model that was within 0.5 percent of its baseline.
+    """
+
+
+def cards_in_use(cards: str) -> dict[str, float]:
+    """Megabytes already allocated on each card, device-wide so a neighbour's work shows.
+
+    A measurement taken while someone else holds the card is not a slow run, it is a different machine. One check on a shared host reported moss-transcribe-diarize 575 percent slower; four A/B runs on quiet cards put it back within 0.5 percent of its baseline.
+    """
+    used: dict[str, float] = {}
+    try:
+        import torch
+
+        for card in cards.split(","):
+            free, total = torch.xpu.mem_get_info(int(card))
+            used[card] = round((total - free) / 1024**2, 1)
+    except Exception as exc:
+        print(f"    cannot read card memory ({exc}); proceeding without the idle check")
+    return used
+
+
 def allocate_cards(pool: list[int], count: int, taken: set[int]) -> str:
     """Lowest-numbered unused cards from the pool, as a ZE_AFFINITY_MASK.
 
@@ -724,6 +736,7 @@ def measure_launches(
     warmups: int,
     extras: dict[str, tuple[str, ...]],
     launches: int,
+    idle_mib: float,
 ) -> dict:
     """Measure the model across whole server restarts, not just repeats inside one.
 
@@ -733,7 +746,7 @@ def measure_launches(
     for index in range(launches):
         if launches > 1:
             print(f"  launch {index + 1}/{launches}", flush=True)
-        runs.append(measure(model, pool, repeats, warmups, extras))
+        runs.append(measure(model, pool, repeats, warmups, extras, idle_mib))
     if launches == 1:
         return runs[0]
     folded = fold_samples(runs)
@@ -766,11 +779,19 @@ def measure(
     repeats: int,
     warmups: int,
     extras: dict[str, tuple[str, ...]],
+    idle_mib: float = 1024.0,
 ) -> dict:
     """Serve the model, and its judge when it has one, then sample it warmups+repeats times."""
     servers = []
     taken: set[int] = set()
     cards = allocate_cards(pool, model.cards, taken)
+    busy_before = cards_in_use(cards)
+    noisy = {card: mib for card, mib in busy_before.items() if mib > idle_mib}
+    if noisy:
+        raise CardsBusy(
+            f"card(s) not idle before launch: {noisy} MiB in use, over the {idle_mib:g} MiB "
+            "bar; another process on the card makes this a different machine"
+        )
     try:
         judge_url = ""
         if model.judge:
@@ -805,6 +826,7 @@ def measure(
 
     folded = fold_samples(samples[warmups:])
     folded["cards"] = cards
+    folded["cards_used_mib"] = {"before": busy_before, "after": cards_in_use(cards)}
     return folded
 
 
@@ -982,13 +1004,13 @@ def main() -> int:
     parser.add_argument(
         "--close-tolerance",
         type=float,
-        default=0.03,
+        default=None,
         help="relative band for loudness, which moves when kernels change even under a seed",
     )
     parser.add_argument(
         "--absolute-tolerance",
         type=float,
-        default=0.05,
+        default=None,
         help="absolute headroom for a rate such as WER",
     )
     # A floor, not the usual gate: the per-field value is three times the recorded spread
@@ -999,13 +1021,13 @@ def main() -> int:
     parser.add_argument(
         "--speed-tolerance",
         type=float,
-        default=0.10,
+        default=None,
         help="lower bound on the speed regression allowed, before per-field spread is considered",
     )
     parser.add_argument(
         "--speed-headroom",
         type=float,
-        default=3.0,
+        default=None,
         help="multiple of a field's recorded spread to allow; the larger of this and the floor wins",
     )
     # A driver bug on one host must not change what another host measures, so the
@@ -1016,6 +1038,12 @@ def main() -> int:
         default=[],
         metavar="KEY=ARGS",
         help="extra serve args for one model on this host, e.g. qwen3-tts=--vocoder.factory.async_decode false",
+    )
+    parser.add_argument(
+        "--idle-mib",
+        type=float,
+        default=1024.0,
+        help="refuse to measure a card already holding more than this; a neighbour's work reads as a regression otherwise",
     )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
@@ -1067,12 +1095,33 @@ def main() -> int:
         )
         return 2
 
-    tolerances = {
+    # An explicit flag wins, then whatever this environment recorded, then the built-in.
+    # The recorded value used to be decorative: a check took the CLI default and ignored the
+    # floor the host had measured for itself, so one host's gate was applied to another and
+    # its models false-fired.
+    BUILTIN_TOLERANCES = {
+        "close": 0.03,
+        "absolute": 0.05,
+        "speed": 0.10,
+        "speed_headroom": 3.0,
+    }
+    FLAG_FOR = {
         "close": args.close_tolerance,
         "absolute": args.absolute_tolerance,
         "speed": args.speed_tolerance,
         "speed_headroom": args.speed_headroom,
     }
+    recorded_tolerances = entry.get("tolerances", {})
+    tolerances = {}
+    for name, builtin in BUILTIN_TOLERANCES.items():
+        if FLAG_FOR[name] is not None:
+            tolerances[name], source = FLAG_FOR[name], "the flag"
+        elif name in recorded_tolerances:
+            tolerances[name], source = recorded_tolerances[name], "this entry"
+        else:
+            tolerances[name], source = builtin, "the built-in default"
+        if name == "speed":
+            print(f"speed floor {tolerances[name]:.1%}, from {source}")
 
     def flush(partial: dict[str, Any]) -> None:
         """Persist what is measured so far, so an interrupted sweep resumes instead of restarting."""
@@ -1118,8 +1167,18 @@ def main() -> int:
             continue
         try:
             observed = measure_launches(
-                model, pool, args.repeats, args.warmups, extras, args.launches
+                model,
+                pool,
+                args.repeats,
+                args.warmups,
+                extras,
+                args.launches,
+                args.idle_mib,
             )
+        except CardsBusy as exc:
+            print(f"  SKIPPED: {exc}", flush=True)
+            skipped.append(f"{key}: {exc}")
+            continue
         except Exception as exc:
             failures.append(f"{key}: did not produce a measurement: {exc}")
             print(f"  FAILED: {exc}", flush=True)
