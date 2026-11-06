@@ -4,18 +4,20 @@
 
 A run serves each model with the recipe from docs/get_started/installation_xpu.md, sends a fixed request set, and compares the result against a committed baseline, so "is this branch slower or less correct than the last known-good tree" has an answer that does not depend on anyone remembering numbers.
 
-Four comparison classes, because the stack pins some outputs and not others:
+Four comparison classes, one per kind of comparison the field deserves:
 
     exact   text output and sample rate. Greedy decode with the radix cache off makes a transcript or a chat answer reproducible, so these must match character for character.
     atmost  round-trip word error rate, held under an absolute ceiling.
-    loose   generated audio duration and loudness. CreateSpeechRequest carries no seed or temperature, so /v1/audio/speech cannot pin TTS sampling: Qwen3-TTS was measured emitting 92160 to 134400 frames for one fixed input across six repeats. A wide band here catches a dead or truncated vocoder and nothing finer, which is why audio models are scored on round-trip text instead.
+    close   loudness. Reproducible under a seed, but a kernel change moves the vocoder's floats, so it gets a band rather than equality.
     speed   latency and throughput, with a directional relative floor.
 
-Reproducibility is asserted, not assumed: an exact field that disagrees across repeats fails the run rather than being written to the baseline. That check is what found the TTS sampling jitter.
+Reproducibility is asserted, not assumed: an exact field that disagrees across repeats fails the run rather than being written to the baseline. That check is what showed Qwen3-TTS emitting 92160 to 134400 frames for one input until the request carried a seed, and what proves the seed works now that it does.
 
 Speed is the median of repeated samples after two discarded warmups, at concurrency 1. Concurrency 1 is deliberate: Qwen3-TTS throughput at concurrency 4 has been seen to swing by more than 1.5x between runs of one tree on this hardware, which is too noisy to gate on.
 
 A speed field is allowed the larger of a floor and three times the spread it showed when it was recorded, because one tolerance for every model is wrong in both directions at once: in one B60 sweep Qwen3-ASR latency wobbled 0.4 percent and Whisper 8.9 percent, so a shared 10 percent would let a 5 percent ASR regression through while still flaring on Whisper.
+
+With --launches above 1 the speed figure is the slowest launch rather than the median of them. These models turn out to be modal, not noisy, and the slow mode is the only anchor a gate can hold without firing on a clean run.
 
 Baselines are per environment. The file holds one entry per host, card model, cards and torch/sglang version, and a check against an environment the file has never seen stops rather than comparing numbers that were never comparable.
 
@@ -90,6 +92,10 @@ class XpuModel:
     serve_args: tuple[str, ...] = ()
     # Why this model cannot be measured here. Non-empty means skip, not fail.
     unservable: str = ""
+    # Variants entry the serve args select. Stage derivation has to follow it: --text-only
+    # drops the talker, and aiming a determinism override at a stage the chosen pipeline
+    # does not have is rejected at engine build.
+    config_variant: str = ""
     payload: dict[str, Any] = field(default_factory=dict)
     # Extra process environment the guide's recipe calls for.
     env: dict[str, str] = field(default_factory=dict)
@@ -169,7 +175,12 @@ MODELS: tuple[XpuModel, ...] = (
         model_path="dots-studio/dots.tts-soar",
         probe="speech",
         serve_args=("--config", "examples/configs/dots_tts_soar.yaml"),
-        payload={"voice": "default"},
+        payload={
+            "voice": "default",
+            "references": [
+                {"audio_path": str(REFERENCE_AUDIO), "text": REFERENCE_TEXT}
+            ],
+        },
         judge="qwen3-asr",
     ),
     XpuModel(
@@ -210,6 +221,7 @@ MODELS: tuple[XpuModel, ...] = (
         model_path="Qwen/Qwen3-Omni-30B-A3B-Instruct",
         probe="chat",
         cards=8,
+        config_variant="text",
         serve_args=(
             "--text-only",
             "--thinker.process",
@@ -226,6 +238,9 @@ MODELS: tuple[XpuModel, ...] = (
         name="MOSS-Transcribe-Diarize",
         model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
         probe="transcription",
+        # Its transcript carries diarization tokens ("145s01 how many cars ... picture441"),
+        # so the word error rate reads around 0.25 with every word correct. The exact
+        # transcript is the real gate here; the rate only has to stop rising.
         serve_args=(
             "--asr.engine.max_running_requests",
             "16",
@@ -303,7 +318,12 @@ MODELS: tuple[XpuModel, ...] = (
         probe="speech",
         # Base shares SOAR's config; the solver settings live there, not on the CLI.
         serve_args=("--config", "examples/configs/dots_tts_soar.yaml"),
-        payload={"voice": "default"},
+        payload={
+            "voice": "default",
+            "references": [
+                {"audio_path": str(REFERENCE_AUDIO), "text": REFERENCE_TEXT}
+            ],
+        },
         judge="qwen3-asr",
     ),
     XpuModel(
@@ -319,6 +339,7 @@ MODELS: tuple[XpuModel, ...] = (
         name="MiniCPM-o 4.5",
         model_path="openbmb/MiniCPM-o-4_5",
         probe="chat",
+        config_variant="text",
         serve_args=("--text-only",),
         startup_seconds=1800,
     ),
@@ -431,7 +452,7 @@ def normalize_text(text: str) -> str:
 def audio_shape(raw: bytes) -> dict[str, float]:
     """Frame count, rate and loudness of a WAV payload.
 
-    Only the rate is stable across runs. Frame count follows the sampling, which /v1/audio/speech cannot pin, so the caller decides which band each field belongs in.
+    All of it is stable across runs once the request carries a seed; the caller decides which comparison class each field belongs in.
     """
     with wave.open(io.BytesIO(raw)) as handle:
         frames = handle.getnframes()
@@ -498,6 +519,9 @@ def synthesize(
         "model": model.model_path,
         "input": text,
         "response_format": "wav",
+        # CreateSpeechRequest takes a seed; whether a given model honours it is the
+        # question the frame count answers.
+        "seed": 0,
         **model.payload,
     }
     started = time.perf_counter()
@@ -511,15 +535,12 @@ def probe_speech(base_url: str, model: XpuModel, judge_url: str) -> dict:
     audio, elapsed = synthesize(base_url, model, SPOKEN_TEXT, timeout=600)
     shape = audio_shape(audio)
     result: dict[str, Any] = {
-        "exact": {"sample_rate": shape["sample_rate"]},
+        # Seeded, Qwen3-TTS repeated frames and loudness exactly across six reps, so the
+        # frame count is held exact. Loudness still gets a band: the token stream is
+        # reproducible but a kernel change moves the vocoder's floats.
+        "exact": {"sample_rate": shape["sample_rate"], "frames": shape["frames"]},
         "atmost": {},
-        # Duration and loudness ride the unpinnable sampling; they only catch a vocoder
-        # that went silent or stopped early.
-        "loose": {
-            "audio_seconds": shape["audio_seconds"],
-            "peak": shape["peak"],
-            "rms": shape["rms"],
-        },
+        "close": {"peak": shape["peak"], "rms": shape["rms"]},
         "speed": {
             "latency_s": elapsed,
             "audio_seconds_per_wall_second": shape["audio_seconds"] / elapsed,
@@ -540,7 +561,7 @@ def probe_music(base_url: str, model: XpuModel, judge_url: str) -> dict:
     shape = audio_shape(audio)
     return {
         "exact": {"sample_rate": shape["sample_rate"]},
-        "loose": {"audio_seconds": shape["audio_seconds"], "rms": shape["rms"]},
+        "close": {"audio_seconds": shape["audio_seconds"], "rms": shape["rms"]},
         "speed": {"latency_s": elapsed},
     }
 
@@ -576,38 +597,40 @@ PROBES: dict[str, Callable[[str, XpuModel, str], dict]] = {
     "chat": probe_chat,
 }
 
-COMPARED_GROUPS = ("exact", "atmost", "loose", "speed")
-
-# Probes whose endpoint cannot pin how much output the model generates, because
-# CreateSpeechRequest carries no seed or temperature. Measured on a B60, Qwen3-TTS spread
-# 76 percent on latency and 222 percent on throughput across repeats of one input, both
-# tracking the generated length rather than the stack's speed. Their timing and loudness
-# are recorded for trend-watching and never gated; round-trip text is the gate instead.
-UNPINNED_OUTPUT_PROBES = {"speech", "music"}
+COMPARED_GROUPS = ("exact", "atmost", "close", "speed")
 
 
 ENGINE_STAGE_CACHE: dict[str, tuple[str, ...]] = {}
 
 
-def engine_stages(model_path: str) -> tuple[str, ...]:
+def engine_stages(model_path: str, variant: str = "") -> tuple[str, ...]:
     """Stage names that own an SGLang engine, read from the model's own pipeline config.
 
     Derived rather than listed per model: a stage-scoped override aimed at a stage the
     pipeline does not have is rejected only when the engine is built, minutes into a load.
     """
-    if model_path in ENGINE_STAGE_CACHE:
-        return ENGINE_STAGE_CACHE[model_path]
+    cache_key = f"{model_path}@{variant}"
+    if cache_key in ENGINE_STAGE_CACHE:
+        return ENGINE_STAGE_CACHE[cache_key]
     try:
+        import importlib
+
         from sglang_omni.config.manager import resolve_config_cls_for_model_path
 
-        config = resolve_config_cls_for_model_path(model_path)(model_path=model_path)
+        config_cls = resolve_config_cls_for_model_path(model_path)
+        if variant:
+            variants = getattr(
+                importlib.import_module(config_cls.__module__), "Variants", {}
+            )
+            config_cls = variants.get(variant, config_cls)
+        config = config_cls(model_path=model_path)
         stages = tuple(
             stage.name for stage in config.stages if getattr(stage, "engine", None)
         )
     except Exception as exc:
         print(f"  could not derive engine stages ({exc}); serving without them")
         stages = ()
-    ENGINE_STAGE_CACHE[model_path] = stages
+    ENGINE_STAGE_CACHE[cache_key] = stages
     return stages
 
 
@@ -626,7 +649,7 @@ def serve_command(model: XpuModel, port: int, extra: tuple[str, ...] = ()) -> li
         *model.serve_args,
         *extra,
     ]
-    for stage in engine_stages(model.model_path):
+    for stage in engine_stages(model.model_path, model.config_variant):
         for key, value in DETERMINISM_ENGINE_ARGS.items():
             command += [f"--{stage}.engine.{key}", value]
     return command
@@ -666,6 +689,49 @@ def allocate_cards(pool: list[int], count: int, taken: set[int]) -> str:
     chosen = free[:count]
     taken.update(chosen)
     return ",".join(str(card) for card in chosen)
+
+
+def measure_launches(
+    model: XpuModel,
+    pool: list[int],
+    repeats: int,
+    warmups: int,
+    extras: dict[str, tuple[str, ...]],
+    launches: int,
+) -> dict:
+    """Measure the model across whole server restarts, not just repeats inside one.
+
+    Restarting is the variance a gate has to survive and repeats cannot see it. Measured on one B60, three launches of Qwen3-ASR gave medians 0.17559, 0.16885 and 0.17466 -- 3.9 percent apart -- while each launch reported about 1 percent internally. On Crescent Island the same comparison was 13 percent against 0.85 percent. With more than one launch the recorded spread becomes the launch-to-launch figure, which is what the tolerance should be derived from.
+    """
+    runs = []
+    for index in range(launches):
+        if launches > 1:
+            print(f"  launch {index + 1}/{launches}", flush=True)
+        runs.append(measure(model, pool, repeats, warmups, extras))
+    if launches == 1:
+        return runs[0]
+    folded = fold_samples(runs)
+    folded["speed"] = pessimistic_speed(runs)
+    folded["within_run_spread"] = runs[0].get("spread", {})
+    folded["launches"] = launches
+    return folded
+
+
+def pessimistic_speed(runs: list[dict]) -> dict[str, float]:
+    """The slowest speed each field reached across the launches, not the median of them.
+
+    These models are modal rather than noisy: on one host Qwen3-ASR sat in two conditions about 11 percent apart, each internally tight to roughly 1 percent, while Fun-ASR and ARK-ASR moved the other way across the same change. A baseline at the median of such a set false-fires whenever the slow mode comes back. Anchored at the slowest, a fast mode can only ever read as an improvement, which the run reports, and a real regression still has to clear the slowest mode plus the tolerance.
+    """
+    worst: dict[str, float] = {}
+    for run in runs:
+        for name, value in run.get("speed", {}).items():
+            if name not in worst:
+                worst[name] = value
+            elif "latency" in name:
+                worst[name] = max(worst[name], value)
+            else:
+                worst[name] = min(worst[name], value)
+    return worst
 
 
 def measure(
@@ -711,12 +777,7 @@ def measure(
         for proc in reversed(servers):
             stop_server(proc)
 
-    folded = fold_samples(samples[warmups:])
-    if model.probe in UNPINNED_OUTPUT_PROBES:
-        # Renamed so compare() cannot reach them.
-        for group in ("loose", "speed"):
-            folded[f"{group}_informational"] = folded.pop(group)
-    return folded
+    return fold_samples(samples[warmups:])
 
 
 def fold_samples(samples: list[dict]) -> dict:
@@ -791,14 +852,14 @@ def compare(
         elif got < want:
             gains.append(f"{key}: {name} fell to {got:.4f} from {want:.4f}")
 
-    for name, want in baseline.get("loose", {}).items():
-        got = observed.get("loose", {}).get(name)
+    for name, want in baseline.get("close", {}).items():
+        got = observed.get("close", {}).get(name)
         if got is None:
             failures.append(f"{key}: {name} missing from this run")
-        elif want and abs(got - want) / want > tolerances["loose"]:
+        elif want and abs(got - want) / want > tolerances["close"]:
             failures.append(
                 f"{key}: {name} moved {(got - want) / want:+.2%} "
-                f"(baseline {want:.6g}, observed {got:.6g}, allowed +-{tolerances['loose']:.1%})"
+                f"(baseline {want:.6g}, observed {got:.6g}, allowed +-{tolerances['close']:.1%})"
             )
 
     for name, want in baseline.get("speed", {}).items():
@@ -861,6 +922,12 @@ def main() -> int:
     # above the ninth while the rest spanned 2 percent, so a lone trailing-warm sample set
     # the whole spread.
     parser.add_argument(
+        "--launches",
+        type=int,
+        default=1,
+        help="whole server restarts per model; above 1, speed is anchored at the slowest launch and exact fields must agree across restarts",
+    )
+    parser.add_argument(
         "--warmups",
         type=int,
         default=2,
@@ -877,10 +944,10 @@ def main() -> int:
         help="cards this run may claim; each model takes what its topology needs",
     )
     parser.add_argument(
-        "--loose-tolerance",
+        "--close-tolerance",
         type=float,
-        default=0.60,
-        help="relative band for unpinnable audio fields",
+        default=0.03,
+        help="relative band for loudness, which moves when kernels change even under a seed",
     )
     parser.add_argument(
         "--absolute-tolerance",
@@ -889,12 +956,14 @@ def main() -> int:
         help="absolute headroom for a rate such as WER",
     )
     # A floor, not the usual gate: the per-field value is three times the recorded spread
-    # once that is larger. Kept low on purpose, so a quiet model gets a tight gate rather
-    # than inheriting the noisiest model's allowance.
+    # once that is larger. Default covers relaunch variance that a single launch cannot
+    # measure -- B60 moved 3.9 percent and Crescent Island 13 percent between restarts of
+    # one model. Lower it only when recording with --launches 3 or more, where the spread
+    # already carries that movement.
     parser.add_argument(
         "--speed-tolerance",
         type=float,
-        default=0.03,
+        default=0.10,
         help="lower bound on the speed regression allowed, before per-field spread is considered",
     )
     parser.add_argument(
@@ -963,7 +1032,7 @@ def main() -> int:
         return 2
 
     tolerances = {
-        "loose": args.loose_tolerance,
+        "close": args.close_tolerance,
         "absolute": args.absolute_tolerance,
         "speed": args.speed_tolerance,
         "speed_headroom": args.speed_headroom,
@@ -1012,7 +1081,9 @@ def main() -> int:
             skipped.append(f"{key}: {reason}")
             continue
         try:
-            observed = measure(model, pool, args.repeats, args.warmups, extras)
+            observed = measure_launches(
+                model, pool, args.repeats, args.warmups, extras, args.launches
+            )
         except Exception as exc:
             failures.append(f"{key}: did not produce a measurement: {exc}")
             print(f"  FAILED: {exc}", flush=True)
@@ -1024,9 +1095,7 @@ def main() -> int:
         results[key] = observed
         if args.record:
             flush(results)
-        speed = observed.get("speed") or observed.get("speed_informational", {})
-        note = "" if "speed" in observed else "  (informational, not gated)"
-        print(f"  median  {json.dumps(speed)}{note}")
+        print(f"  median  {json.dumps(observed['speed'])}")
         print(
             f"  accuracy {json.dumps(observed['exact'])} {json.dumps(observed.get('atmost', {}))}"
         )

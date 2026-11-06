@@ -1,5 +1,290 @@
 {
   "environments": {
+    "48a34c857bec": {
+      "fingerprint": {
+        "card_pool": "0,1,2,3,4,5,6,7",
+        "device": "Intel(R) Arc(TM) Pro B60 Graphics",
+        "host": "bmg17690",
+        "sglang": "0.5.23",
+        "torch": "2.14.0+xpu"
+      },
+      "models": {
+        "arkasr": {
+          "atmost": {
+            "word_error_rate": 0.0
+          },
+          "close": {},
+          "exact": {
+            "transcript": "how many cars are there in the picture"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 23.25467006643559,
+            "latency_s": 0.19866977199853864
+          },
+          "spread": {
+            "speed.audio_seconds_per_wall_second": 0.0298,
+            "speed.latency_s": 0.0305
+          }
+        },
+        "auk": {
+          "atmost": {
+            "round_trip_wer": 0.2222222222222222
+          },
+          "close": {
+            "peak": 0.892333984375,
+            "rms": 0.17496961724878954
+          },
+          "exact": {
+            "frames": 96000.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 3.1831013681259077,
+            "latency_s": 1.256636071993853
+          },
+          "spread": {
+            "atmost.round_trip_wer": 0.0,
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0063,
+            "speed.latency_s": 0.0062
+          }
+        },
+        "auk-flash": {
+          "atmost": {
+            "round_trip_wer": 0.3333333333333333
+          },
+          "close": {
+            "peak": 0.970367431640625,
+            "rms": 0.21705149956395076
+          },
+          "exact": {
+            "frames": 96000.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 9.918370520945782,
+            "latency_s": 0.4032920520112384
+          },
+          "spread": {
+            "atmost.round_trip_wer": 0.0,
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0197,
+            "speed.latency_s": 0.0193
+          }
+        },
+        "dots-tts": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.674102783203125,
+            "rms": 0.0790547395254077
+          },
+          "exact": {
+            "frames": 253440.0,
+            "sample_rate": 48000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 0.679837318035677,
+            "latency_s": 7.766563940997003
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0213,
+            "speed.latency_s": 0.0215
+          }
+        },
+        "dots-tts-base": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.522705078125,
+            "rms": 0.07689470306385057
+          },
+          "exact": {
+            "frames": 253440.0,
+            "sample_rate": 48000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 0.6702043387456658,
+            "latency_s": 7.8781942979985615
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0234,
+            "speed.latency_s": 0.0235
+          }
+        },
+        "fun-asr": {
+          "atmost": {
+            "word_error_rate": 0.0
+          },
+          "close": {},
+          "exact": {
+            "transcript": "how many cars are there in the picture"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 54.392510125162616,
+            "latency_s": 0.08493816500413232
+          },
+          "spread": {
+            "speed.audio_seconds_per_wall_second": 0.06,
+            "speed.latency_s": 0.0619
+          }
+        },
+        "moss-transcribe-diarize": {
+          "atmost": {
+            "word_error_rate": 0.25
+          },
+          "close": {},
+          "exact": {
+            "transcript": "145s01 how many cars are there in the picture441"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 31.72485285302084,
+            "latency_s": 0.14562715298961848
+          },
+          "spread": {
+            "atmost.word_error_rate": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0259,
+            "speed.latency_s": 0.0254
+          }
+        },
+        "nemotron35-asr": {
+          "atmost": {
+            "word_error_rate": 0.0
+          },
+          "close": {},
+          "exact": {
+            "transcript": "how many cars are there in the picture"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 29.974954951513283,
+            "latency_s": 0.15412867200211622
+          },
+          "spread": {
+            "speed.audio_seconds_per_wall_second": 0.4575,
+            "speed.latency_s": 0.785
+          }
+        },
+        "qwen3-asr": {
+          "atmost": {
+            "word_error_rate": 0.0
+          },
+          "close": {},
+          "exact": {
+            "transcript": "how many cars are there in the picture"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 26.57807140834755,
+            "latency_s": 0.17382751099648885
+          },
+          "spread": {
+            "speed.audio_seconds_per_wall_second": 0.0021,
+            "speed.latency_s": 0.0021
+          }
+        },
+        "qwen3-tts": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.671844482421875,
+            "rms": 0.07395322005512037
+          },
+          "exact": {
+            "frames": 101760.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 3.4489043165913853,
+            "latency_s": 1.229375944007188
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0113,
+            "speed.latency_s": 0.0113
+          }
+        },
+        "qwen3-tts-cv": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.644500732421875,
+            "rms": 0.09488002132009395
+          },
+          "exact": {
+            "frames": 90240.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 3.599919389410843,
+            "latency_s": 1.0444678319909144
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0123,
+            "speed.latency_s": 0.0124
+          }
+        },
+        "qwen3-tts-vd": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.703094482421875,
+            "rms": 0.10604219254343715
+          },
+          "exact": {
+            "frames": 63360.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 3.4970136814209583,
+            "latency_s": 0.7549298460071441
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0023,
+            "speed.latency_s": 0.0023
+          }
+        },
+        "whisper": {
+          "atmost": {
+            "word_error_rate": 0.0
+          },
+          "close": {},
+          "exact": {
+            "transcript": "how many cars are there in the picture"
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 10.311025109206232,
+            "latency_s": 0.4480640819965629
+          },
+          "spread": {
+            "speed.audio_seconds_per_wall_second": 0.0151,
+            "speed.latency_s": 0.0152
+          }
+        }
+      },
+      "recorded_from_commit": "f77027def",
+      "serve_extra": {},
+      "tolerances": {
+        "absolute": 0.05,
+        "close": 0.03,
+        "speed": 0.03,
+        "speed_headroom": 3.0
+      }
+    },
     "fb064c61feb1": {
       "fingerprint": {
         "card_pool": "0,1,2,3",
