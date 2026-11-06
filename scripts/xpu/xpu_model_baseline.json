@@ -119,6 +119,38 @@
             "speed.latency_s": 0.0235
           }
         },
+        "dots-tts-mf": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 24.2
+            },
+            "before": {
+              "0": 24.2
+            }
+          },
+          "close": {
+            "peak": 0.6064453125,
+            "rms": 0.0888027382434083
+          },
+          "exact": {
+            "frames": 253440.0,
+            "sample_rate": 48000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 1.2554096099425252,
+            "latency_s": 4.205798615992535
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.032,
+            "speed.latency_s": 0.0312
+          }
+        },
         "fun-asr": {
           "atmost": {
             "word_error_rate": 0.0
@@ -157,6 +189,57 @@
             "close.rms": 0.0,
             "speed.audio_seconds_per_wall_second": 0.0009,
             "speed.latency_s": 0.0009
+          }
+        },
+        "ming-tts": {
+          "atmost": {
+            "round_trip_wer": 0.2222222222222222
+          },
+          "cards": "0,1",
+          "cards_used_mib": {
+            "after": {
+              "0": 24.2,
+              "1": 25.4
+            },
+            "before": {
+              "0": 196.0,
+              "1": 25.4
+            }
+          },
+          "close": {},
+          "exact": {
+            "sample_rate": 44100.0
+          },
+          "speed": {
+            "latency_s": 2.1142289389972575
+          },
+          "spread": {
+            "atmost.round_trip_wer": 1.0,
+            "speed.latency_s": 0.3951
+          }
+        },
+        "minicpm-o": {
+          "atmost": {},
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 24.2
+            },
+            "before": {
+              "0": 24.2
+            }
+          },
+          "close": {},
+          "exact": {
+            "content": "42"
+          },
+          "speed": {
+            "decode_tokens_per_second": 22.64369279735513,
+            "latency_s": 0.13248722400749102
+          },
+          "spread": {
+            "speed.decode_tokens_per_second": 0.005,
+            "speed.latency_s": 0.005
           }
         },
         "moss-transcribe-diarize": {
@@ -238,6 +321,15 @@
           "atmost": {
             "round_trip_wer": 0.0
           },
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 196.0
+            },
+            "before": {
+              "0": 196.0
+            }
+          },
           "close": {
             "peak": 0.644500732421875,
             "rms": 0.09488002132009395
@@ -247,14 +339,14 @@
             "sample_rate": 24000.0
           },
           "speed": {
-            "audio_seconds_per_wall_second": 3.599919389410843,
-            "latency_s": 1.0444678319909144
+            "audio_seconds_per_wall_second": 3.558872337071804,
+            "latency_s": 1.0565144360007253
           },
           "spread": {
             "close.peak": 0.0,
             "close.rms": 0.0,
-            "speed.audio_seconds_per_wall_second": 0.0123,
-            "speed.latency_s": 0.0124
+            "speed.audio_seconds_per_wall_second": 0.0108,
+            "speed.latency_s": 0.0108
           }
         },
         "qwen3-tts-vd": {
@@ -298,7 +390,7 @@
           }
         }
       },
-      "recorded_from_commit": "af3172fb7",
+      "recorded_from_commit": "7c8ece43a",
       "serve_extra": {},
       "tolerances": {
         "absolute": 0.05,

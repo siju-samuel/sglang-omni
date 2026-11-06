@@ -11,6 +11,8 @@ Four comparison classes, one per kind of comparison the field deserves:
     close   loudness. Reproducible under a seed, but a kernel change moves the vocoder's floats, so it gets a band rather than equality.
     speed   latency and throughput, with a directional relative floor.
 
+A fifth group, observed, is recorded and never gated. It exists for the two models whose server refuses a seed (Ming-Omni-TTS, ZONOS2): they choose their own utterance length, which moved 2x between repeats, so length, loudness and the throughput derived from length cannot gate anything. Those models gate on sample rate, latency, and the round-trip WER ceiling, which tolerates a varying utterance while still catching one that stops being intelligible.
+
 Reproducibility is asserted, not assumed: an exact field that disagrees across repeats fails the run rather than being written to the baseline. That check is what showed Qwen3-TTS emitting 92160 to 134400 frames for one input until the request carried a seed, and what proves the seed works now that it does.
 
 Speed is the median of repeated samples after two discarded warmups, at concurrency 1. Concurrency 1 is deliberate: Qwen3-TTS throughput at concurrency 4 has been seen to swing by more than 1.5x between runs of one tree on this hardware, which is too noisy to gate on.
@@ -22,6 +24,7 @@ With --launches above 1 the speed figure is the slowest launch rather than the m
 Baselines are per environment. The file holds one entry per host, card model, cards and torch/sglang version, and a check against an environment the file has never seen stops rather than comparing numbers that were never comparable.
 
 Usage:
+    xpu_model_baseline.py                  # check every model against the baseline
     xpu_model_baseline.py --list
     xpu_model_baseline.py --models qwen3-asr,qwen3-tts --record
     xpu_model_baseline.py --models qwen3-asr,qwen3-tts
@@ -149,6 +152,7 @@ MODELS: tuple[XpuModel, ...] = (
         name="Qwen3-TTS CustomVoice",
         model_path="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
         probe="speech",
+        serve_args=("--config", "examples/configs/qwen3_tts_1_7b_customvoice.yaml"),
         payload={"voice": "Ryan", "task_type": "CustomVoice", "language": "English"},
         judge="qwen3-asr",
     ),
@@ -196,7 +200,15 @@ MODELS: tuple[XpuModel, ...] = (
         probe="music",
         cards=2,
         serve_args=("--mem-fraction-static", "0.7"),
-        payload={"voice": "default"},
+        # Music takes a style prompt, not a voice, and an explicit token cap: the default
+        # length makes the run unbounded and not comparable between sweeps.
+        payload={
+            "instructions": (
+                "An energetic arena rock anthem with distorted electric guitars, punchy live "
+                "drums and a soaring male vocal at 130 BPM, wide stereo image"
+            ),
+            "max_new_tokens": 750,
+        },
     ),
     XpuModel(
         key="ming-tts",
@@ -205,6 +217,8 @@ MODELS: tuple[XpuModel, ...] = (
         probe="speech",
         cards=2,
         serve_args=(
+            "--config",
+            "examples/configs/ming_omni_tts.yaml",
             "--tts_engine.tp_size",
             "2",
             "--tts_engine.gpu",
@@ -219,6 +233,10 @@ MODELS: tuple[XpuModel, ...] = (
             "0.78",
         ),
         payload={"voice": "default"},
+        # FlowLoss sampling is unseeded; the request builder rejects a seed outright
+        seedless=True,
+        # Unseeded, so the WER ceiling is the only accuracy gate it can carry.
+        judge="qwen3-asr",
         startup_seconds=1800,
     ),
     XpuModel(
@@ -335,11 +353,57 @@ MODELS: tuple[XpuModel, ...] = (
         judge="qwen3-asr",
     ),
     XpuModel(
+        key="dots-tts-mf",
+        name="dots.tts MF",
+        # The config pins a revision, so the path carries it: passing the bare repo id
+        # would override the pin and measure a checkpoint nobody validated.
+        model_path="dots-studio/dots.tts-mf@c28105adc8228143392b4e346994ff613ee48a06",
+        probe="speech",
+        # MF is the one dots checkpoint with continuous batching; the config ships 16
+        # slots and the guide validated 4 on a 24 GB B60.
+        serve_args=(
+            "--config",
+            "examples/configs/dots_tts.yaml",
+            "--latent_engine.engine.max_running_requests",
+            "4",
+            "--latent_engine.engine.cuda_graph_max_bs",
+            "4",
+        ),
+        payload={
+            "voice": "default",
+            "references": [
+                {"audio_path": str(REFERENCE_AUDIO), "text": REFERENCE_TEXT}
+            ],
+        },
+        judge="qwen3-asr",
+    ),
+    XpuModel(
         key="ming-flash-omni",
         name="Ming-flash-omni-2.0",
         model_path="inclusionAI/Ming-flash-omni-2.0",
         probe="chat",
-        serve_args=("--model-name", "ming-omni"),
+        config_variant="text",
+        # 194 GiB of bf16 thinker weights on a 24 GB card: TP=1 plus host offload.
+        # Offload re-uploads weights inside a captured region, so the decode graph is off.
+        serve_args=(
+            "--model-name",
+            "ming-omni",
+            "--text-only",
+            "--thinker.tp_size",
+            "1",
+            "--thinker.gpu",
+            "0",
+            "--audio_encoder.gpu",
+            "0",
+            "--image_encoder.gpu",
+            "0",
+            "--mem-fraction-static",
+            "0.30",
+            "--thinker.engine.cpu_offload_gb",
+            "190",
+            "--thinker.engine.cuda_graph_backend_decode",
+            "disabled",
+        ),
         startup_seconds=1800,
     ),
     XpuModel(
@@ -348,7 +412,8 @@ MODELS: tuple[XpuModel, ...] = (
         model_path="openbmb/MiniCPM-o-4_5",
         probe="chat",
         config_variant="text",
-        serve_args=("--text-only",),
+        # The auto thinker fraction leaves the KV cache no room for its ~15 GB of weights.
+        serve_args=("--text-only", "--thinker.engine.mem_fraction_static", "0.85"),
         startup_seconds=1800,
     ),
     XpuModel(
@@ -554,10 +619,25 @@ def probe_speech(base_url: str, model: XpuModel, judge_url: str) -> dict:
             "audio_seconds_per_wall_second": shape["audio_seconds"] / elapsed,
         },
     }
-    # Seeded, frames repeat exactly and belong with the text. Unseeded they follow the
-    # sampling, so they move to the band and only catch a truncated vocoder.
+    # Seeded, frames repeat exactly and belong with the text.
+    #
+    # Unseeded, the model chooses its own length: Ming-Omni-TTS read the same sentence
+    # 2x longer between repeats (frames spread 112%, throughput 137%). No band holds
+    # that, and leaving it in a compared group would size this entry's whole speed floor
+    # from it -- including latency, which is steady to 20%. So length is recorded for
+    # the record and not gated, throughput (audio seconds per wall second, which is
+    # length divided by time) goes with it, and the accuracy gate becomes the round-trip
+    # WER below: a ceiling tolerates a varying utterance while still catching a model
+    # that has stopped being intelligible.
     if model.seedless:
-        result["close"]["frames"] = shape["frames"]
+        result["observed"] = {
+            "frames": shape["frames"],
+            "peak": result["close"].pop("peak"),
+            "rms": result["close"].pop("rms"),
+            "audio_seconds_per_wall_second": result["speed"].pop(
+                "audio_seconds_per_wall_second"
+            ),
+        }
     else:
         result["exact"]["frames"] = shape["frames"]
     if judge_url:
@@ -686,6 +766,79 @@ def launch(model: XpuModel, cards: str, extra: tuple[str, ...] = ()) -> tuple[An
         health_body_contains=None,
     )
     return proc, f"http://127.0.0.1:{port}"
+
+
+def download_blocked(model_path: str) -> str:
+    """Why this checkpoint cannot be fetched here, or an empty string if it can.
+
+    Ming-flash-omni-2.0 is 194 GiB and was half cached: the run spent 30 minutes
+    downloading, filled the volume, and then reported "service not ready within 1800s",
+    which names neither the cause nor the fix. A cold checkpoint needs room, so say so
+    before spending the half hour.
+    """
+    cache = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    while cache and not os.path.isdir(cache):
+        cache = os.path.dirname(cache)
+    repo, _, revision = model_path.partition("@")
+    blobs = os.path.join(cache, "hub", f"models--{repo.replace('/', '--')}", "blobs")
+    # What this model has resident, which is not the size of its cache directory: blobs
+    # are content-addressed in a store shared with every other repo and linked in from
+    # here, so a complete checkpoint's own directory holds nothing but links. A link
+    # that resolves is a finished blob and counts its length; a plain file is a transfer
+    # in progress and counts the disk it holds, since a part-downloaded blob is sparse.
+    local_gib = 0.0
+    interrupted = False
+    for root, _, names in os.walk(blobs, followlinks=False):
+        for name in names:
+            path = os.path.join(root, name)
+            if name.endswith(".incomplete"):
+                interrupted = True
+            else:
+                pass
+            if os.path.islink(path):
+                target = os.path.realpath(path)
+                if os.path.exists(target):
+                    local_gib += os.path.getsize(target) / 2**30
+                else:
+                    continue
+            else:
+                local_gib += os.stat(path).st_blocks * 512 / 2**30
+    try:
+        from huggingface_hub import HfApi
+
+        info = HfApi().model_info(repo, revision=revision or None, files_metadata=True)
+        repo_gib = sum(item.size or 0 for item in info.siblings) / 2**30
+    except Exception as exc:
+        # Offline, or gated. Not knowing the size is not grounds to skip a model: fall
+        # through and let the launch report whatever actually goes wrong.
+        print(f"  could not size {repo} before fetching it ({exc})")
+        return ""
+    usage = os.statvfs(cache or "/")
+    free_gib = usage.f_bavail * usage.f_frsize / 2**30
+    # The repo total is an upper bound on what a load needs, not an estimate of it:
+    # Whisper publishes the same weights as safetensors, bin and ONNX, and the loader
+    # fetches one of the three. So the repo size only decides the cold case, and a
+    # checkpoint that already has weights resident is never called too big -- a false
+    # skip silently stops testing a model that works.
+    #
+    # An interrupted transfer is the case worth catching, and it is the one that can be
+    # measured: the blobs it left behind say how much is still outstanding.
+    if interrupted:
+        missing_gib = max(repo_gib - local_gib, 0.0)
+        if free_gib >= missing_gib * 1.1:
+            return ""
+        else:
+            return (
+                f"a previous fetch was interrupted and needs about {missing_gib:.0f} GiB "
+                f"more; the checkpoint volume has {free_gib:.1f} GiB free"
+            )
+    elif local_gib < 1.0 and free_gib < repo_gib * 1.1:
+        return (
+            f"not cached: the repo is about {repo_gib:.0f} GiB and the checkpoint "
+            f"volume has {free_gib:.1f} GiB free"
+        )
+    else:
+        return ""
 
 
 class CardsBusy(RuntimeError):
@@ -845,7 +998,13 @@ def fold_samples(samples: list[dict]) -> dict:
                     )
                 folded[group][key] = values[0]
                 continue
-            folded[group][key] = statistics.median(values)
+            # A ceiling takes the worst sample, everything else the median. Recording the
+            # median of a ceiling metric understates it: Ming-Omni-TTS, which cannot be
+            # seeded, scored WER 0.0, 0.222, 0.0 in one run, and a 0.0 median plus the
+            # 0.05 band would have failed the next healthy run that babbled once.
+            folded[group][key] = (
+                max(values) if group == "atmost" else statistics.median(values)
+            )
             if len(values) > 1 and folded[group][key]:
                 span = (max(values) - min(values)) / folded[group][key]
                 folded["spread"][f"{group}.{key}"] = round(span, 4)
@@ -854,6 +1013,18 @@ def fold_samples(samples: list[dict]) -> dict:
                         f"    still warming on {key}: samples move one way across the whole run "
                         f"({values[0]:.6g} to {values[-1]:.6g}); raise --warmups before trusting the spread"
                     )
+    # Measured but deliberately not gated, so it has to be carried here explicitly:
+    # the loop above only walks the compared groups, which would drop it.
+    if samples[0].get("observed"):
+        folded["observed"] = {}
+        folded["observed_span"] = {}
+        for key in samples[0]["observed"]:
+            values = [sample["observed"][key] for sample in samples]
+            middle = statistics.median(values)
+            folded["observed"][key] = middle
+            folded["observed_span"][key] = round(
+                (max(values) - min(values)) / (middle or 1), 4
+            )
     return folded
 
 
@@ -1165,6 +1336,11 @@ def main() -> int:
             print(f"  SKIPPED: {reason}", flush=True)
             skipped.append(f"{key}: {reason}")
             continue
+        shortfall = download_blocked(model.model_path)
+        if shortfall:
+            print(f"  SKIPPED: {shortfall}", flush=True)
+            skipped.append(f"{key}: {shortfall}")
+            continue
         try:
             observed = measure_launches(
                 model,
@@ -1213,14 +1389,14 @@ def main() -> int:
             flush=True,
         )
 
-    if args.record and results:
-        flush(results)
-    elif args.record:
-        print("nothing measured; leaving the baseline untouched")
-        print(
-            f"\nwrote {len(results)} model(s) for environment {env_key} to {args.baseline}"
-        )
-        return 1 if failures else 0
+    if args.record:
+        if results:
+            flush(results)
+            print(
+                f"\nwrote {len(results)} model(s) for environment {env_key} to {args.baseline}"
+            )
+        else:
+            print("\nnothing measured; leaving the baseline untouched")
 
     if args.calibrate:
         print("\nobserved spread per field, as a fraction of the median:")
@@ -1233,8 +1409,11 @@ def main() -> int:
         return 0
 
     print()
+    # While recording there is nothing to regress against yet: a failure here is a model
+    # that would not serve or answer, which is a different thing to report.
+    label = "FAILED     " if args.record else "REGRESSION "
     for message in failures:
-        print(f"REGRESSION  {message}")
+        print(f"{label} {message}")
     for message in gains:
         print(f"IMPROVED    {message}")
     if gains:
@@ -1245,7 +1424,8 @@ def main() -> int:
     for message in skipped:
         print(f"SKIPPED     {message}")
     print(
-        f"{len(results)} measured, {len(skipped)} skipped, {len(failures)} regression(s)"
+        f"{len(results)} measured, {len(skipped)} skipped, {len(failures)} "
+        f"{'failure(s)' if args.record else 'regression(s)'}"
     )
     return 1 if failures else 0
 
