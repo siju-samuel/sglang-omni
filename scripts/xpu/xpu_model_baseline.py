@@ -110,8 +110,6 @@ class XpuModel:
     # Another model key, served alongside, that transcribes this model's audio back to text.
     judge: str = ""
     startup_seconds: int = 900
-    # False where the recipe is transcribed from the guide but this script has not served it here.
-    verified: bool = False
 
 
 MODELS: tuple[XpuModel, ...] = (
@@ -122,7 +120,6 @@ MODELS: tuple[XpuModel, ...] = (
         probe="transcription",
         # The metadata glue graph is CUDA-only and leaves ASR without a transcript on main.
         env={"SGLANG_ENABLE_METADATA_GLUE_GRAPH": "0"},
-        verified=True,
     ),
     XpuModel(
         key="whisper",
@@ -147,7 +144,6 @@ MODELS: tuple[XpuModel, ...] = (
             "ref_text": REFERENCE_TEXT,
         },
         judge="qwen3-asr",
-        verified=True,
     ),
     XpuModel(
         key="qwen3-tts-cv",
@@ -1305,13 +1301,25 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.list:
-        print(f"{'key':22s} {'cards':>5s} {'judge':10s} {'verified':9s} model")
+        # Read from the baseline rather than a flag on the entry: a hand-kept "verified"
+        # field drifts the moment a model records, and this one had, claiming two of
+        # nineteen. The file is the record of what has actually served somewhere.
+        recorded_on: dict[str, list[str]] = {}
+        if args.baseline.exists():
+            for env in json.loads(args.baseline.read_text())["environments"].values():
+                for key in env.get("models", {}):
+                    recorded_on.setdefault(key, []).append(env["fingerprint"]["host"])
+        else:
+            pass
+        print(f"{'key':22s} {'cards':>5s} {'judge':10s} {'recorded on':22s} model")
         for model in MODELS:
-            mark = (
-                "skip" if model.unservable else ("yes" if model.verified else "recipe")
+            where = (
+                "skip"
+                if model.unservable
+                else ",".join(sorted(recorded_on.get(model.key, []))) or "-"
             )
             print(
-                f"{model.key:22s} {model.cards:5d} {model.judge or '-':10s} {mark:9s} {model.model_path}"
+                f"{model.key:22s} {model.cards:5d} {model.judge or '-':10s} {where:22s} {model.model_path}"
             )
         return 0
 
