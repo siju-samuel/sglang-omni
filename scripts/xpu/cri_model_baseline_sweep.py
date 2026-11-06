@@ -163,8 +163,8 @@ def download(repo: str, patterns: tuple[str, ...] | None) -> None:
     snapshot_download(repo, max_workers=8, allow_patterns=patterns)
 
 
-def cards_in_use(count: int) -> list[float]:
-    """MiB in use on the first `count` cards, read from inside this container.
+def cards_in_use() -> list[float]:
+    """MiB in use on every visible card, read from inside this container.
 
     Through torch rather than xpu-smi: xpu-smi is not usable in this container, and XPU's
     mem_get_info reports device-wide usage, so it sees another container's allocation on a
@@ -173,8 +173,7 @@ def cards_in_use(count: int) -> list[float]:
     probe = (
         "import json, torch; torch.xpu.init();\n"
         "print(json.dumps([(t - f) / 2**20 for f, t in "
-        "(torch.xpu.mem_get_info(i) for i in range(min(%d, torch.xpu.device_count())))]))"
-        % count
+        "(torch.xpu.mem_get_info(i) for i in range(torch.xpu.device_count()))]))"
     )
     try:
         out = subprocess.run(
@@ -190,8 +189,14 @@ def cards_in_use(count: int) -> list[float]:
         return []
 
 
-def wait_for_idle_cards(count: int, ceiling_mib: float, wait_s: int) -> tuple[bool, str]:
-    """Hold until the cards this measurement needs are quiet.
+def wait_for_idle_cards(
+    wanted: list[int], ceiling_mib: float, wait_s: int
+) -> tuple[bool, str]:
+    """Hold until the cards this measurement will actually use are quiet.
+
+    Scoped to the cards the run will claim, taken from the pool in the order the script
+    allocates them, rather than dev0 upward: on a host where a neighbour holds dev0 and dev1
+    is free, checking dev0 refuses a run that would have been clean.
 
     These cards are shared with other users' containers, and a neighbour's workload does not
     fail a run, it slows it: a sweep measured against a busy card recorded Qwen3-ASR at
@@ -200,31 +205,44 @@ def wait_for_idle_cards(count: int, ceiling_mib: float, wait_s: int) -> tuple[bo
     """
     deadline = time.time() + wait_s
     while True:
-        usage = cards_in_use(count)
+        usage = cards_in_use()
         if not usage:
             return True, "card usage unreadable; measuring anyway"
-        busy = [f"dev{i}={mib:.0f}MiB" for i, mib in enumerate(usage) if mib > ceiling_mib]
+        busy = [
+            f"dev{i}={usage[i]:.0f}MiB"
+            for i in wanted
+            if i < len(usage) and usage[i] > ceiling_mib
+        ]
         if not busy:
-            return True, f"cards quiet ({', '.join(f'{m:.0f}' for m in usage)} MiB)"
+            quiet = ", ".join(f"dev{i}={usage[i]:.0f}" for i in wanted if i < len(usage))
+            return True, f"cards quiet ({quiet} MiB)"
         if time.time() >= deadline:
             return False, f"cards still busy after {wait_s}s: {', '.join(busy)}"
         print(f"  waiting for {', '.join(busy)} to go quiet", flush=True)
         time.sleep(30)
 
-def run_one(key: str, repeats: int, tolerance: float, fresh: bool, launches: int) -> tuple[bool, str]:
+
+def run_one(
+    key: str,
+    repeats: int,
+    tolerance: float,
+    fresh: bool,
+    launches: int,
+    check: bool,
+    pool: str,
+) -> tuple[bool, str]:
     log = WORK / f"sweep_{key}.log"
     command = [
         sys.executable,
         str(SCRIPT),
-        "--record",
+        *([] if check else ["--record"]),
         "--models",
         key,
         "--card-pool",
-        "0,1,2,3",
+        pool,
         "--repeats",
         str(repeats),
-        "--speed-tolerance",
-        str(tolerance),
+        *([] if check else ["--speed-tolerance", str(tolerance)]),
         "--baseline",
         str(BASELINE),
     ]
@@ -241,7 +259,9 @@ def run_one(key: str, repeats: int, tolerance: float, fresh: bool, launches: int
         )
     tail = ""
     for line in log.read_text(errors="replace").splitlines():
-        if line.startswith(("  FAILED", "  median", "  accuracy", "REGRESSION")):
+        if line.startswith(
+            ("  FAILED", "  median", "  accuracy", "REGRESSION", "IMPROVED", "speed floor")
+        ) or line.startswith("  SKIPPED"):
             tail += line.strip() + " | "
     return completed.returncode == 0, tail or f"exit {completed.returncode}"
 
@@ -251,6 +271,16 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--speed-tolerance", type=float, default=0.15)
     parser.add_argument("--only", default="", help="comma-separated subset of keys")
+    parser.add_argument(
+        "--card-pool",
+        default="0,1,2,3",
+        help="cards this run may claim, in allocation order",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="check against the recorded baseline instead of recording",
+    )
     parser.add_argument(
         "--launches",
         type=int,
@@ -288,7 +318,10 @@ def main() -> int:
 
     for index, (key, repo, weight_gib, patterns) in enumerate(plan, start=1):
         print(f"\n===== [{index}/{len(plan)}] {key} ({repo}, ~{weight_gib} GiB) =====", flush=True)
-        if key in done and not args.fresh:
+        if args.check and key not in done:
+            print("  no baseline for this host; nothing to check", flush=True)
+            continue
+        if key in done and not args.fresh and not args.check:
             print("  already recorded; skipping download and run", flush=True)
             continue
 
@@ -339,19 +372,39 @@ def main() -> int:
             flush=True,
         )
 
+        pool_cards = [int(c) for c in args.card_pool.split(",") if c.strip()]
         cards_needed = 2 if key in JUDGED else 1
-        quiet, why = wait_for_idle_cards(cards_needed, args.idle_ceiling_mib, args.idle_wait_s)
+        if len(pool_cards) < cards_needed:
+            message = f"needs {cards_needed} card(s), pool has {len(pool_cards)}"
+            print(f"  SKIPPED: {message}", flush=True)
+            ledger["runs"][key] = {"ok": False, "detail": f"not measured: {message}"}
+            write_ledger(ledger)
+            continue
+        wanted = pool_cards[:cards_needed]
+        quiet, why = wait_for_idle_cards(wanted, args.idle_ceiling_mib, args.idle_wait_s)
         print(f"  {why}", flush=True)
         if not quiet:
             ledger["runs"][key] = {"ok": False, "detail": f"not measured: {why}"}
             write_ledger(ledger)
             continue
         started = time.time()
-        ok, detail = run_one(key, args.repeats, args.speed_tolerance, args.fresh, args.launches)
+        ok, detail = run_one(
+            key,
+            args.repeats,
+            args.speed_tolerance,
+            args.fresh,
+            args.launches,
+            args.check,
+            args.card_pool,
+        )
         elapsed = time.time() - started
-        after = cards_in_use(cards_needed)
-        if after and max(after) > args.idle_ceiling_mib:
-            detail += f" | WARNING neighbour on card during run ({max(after):.0f} MiB left after)"
+        after = cards_in_use()
+        after_wanted = [after[i] for i in wanted if i < len(after)]
+        if after_wanted and max(after_wanted) > args.idle_ceiling_mib:
+            detail += (
+                f" | WARNING neighbour on card during run"
+                f" ({max(after_wanted):.0f} MiB left after)"
+            )
             print(f"  {detail}", flush=True)
         print(f"  {'OK' if ok else 'FAILED'} in {elapsed:.0f}s: {detail}", flush=True)
         ledger["runs"][key] = {
