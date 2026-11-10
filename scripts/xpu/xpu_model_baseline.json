@@ -777,29 +777,27 @@
             "round_trip_wer": 0.0
           },
           "close": {
-            "peak": 0.499969482421875,
-            "rms": 0.08471720788687216
+            "peak": 0.511688232421875,
+            "rms": 0.07748309245413183
           },
           "exact": {
-            "frames": 90240.0,
+            "frames": 92160.0,
             "sample_rate": 24000.0
           },
           "launches": 3,
           "speed": {
-            "audio_seconds_per_wall_second": 1.5193004359156235,
-            "latency_s": 2.4748232220008504
+            "audio_seconds_per_wall_second": 6.8018490353972885,
+            "latency_s": 0.5645523709827103
           },
           "spread": {
             "close.peak": 0.0,
             "close.rms": 0.0,
-            "speed.audio_seconds_per_wall_second": 0.0023,
-            "speed.latency_s": 0.0023
+            "speed.audio_seconds_per_wall_second": 0.0113,
+            "speed.latency_s": 0.0113
           },
           "within_run_spread": {
-            "close.peak": 0.0,
-            "close.rms": 0.0,
-            "speed.audio_seconds_per_wall_second": 0.0101,
-            "speed.latency_s": 0.0102
+            "speed.audio_seconds_per_wall_second": 0.0075,
+            "speed.latency_s": 0.0075
           }
         },
         "qwen3-tts-vd": {
@@ -807,29 +805,27 @@
             "round_trip_wer": 0.0
           },
           "close": {
-            "peak": 0.695281982421875,
-            "rms": 0.1170150640091418
+            "peak": 0.632781982421875,
+            "rms": 0.10226597403036917
           },
           "exact": {
-            "frames": 61440.0,
+            "frames": 63360.0,
             "sample_rate": 24000.0
           },
           "launches": 3,
           "speed": {
-            "audio_seconds_per_wall_second": 1.4979455825569137,
-            "latency_s": 1.7090073429972108
+            "audio_seconds_per_wall_second": 6.580386351858845,
+            "latency_s": 0.40119224903173745
           },
           "spread": {
             "close.peak": 0.0,
             "close.rms": 0.0,
-            "speed.audio_seconds_per_wall_second": 0.0153,
-            "speed.latency_s": 0.0151
+            "speed.audio_seconds_per_wall_second": 0.0238,
+            "speed.latency_s": 0.0239
           },
           "within_run_spread": {
-            "close.peak": 0.0,
-            "close.rms": 0.0,
-            "speed.audio_seconds_per_wall_second": 0.0031,
-            "speed.latency_s": 0.0031
+            "speed.audio_seconds_per_wall_second": 0.0093,
+            "speed.latency_s": 0.0094
           }
         },
         "whisper": {
@@ -860,14 +856,6 @@
           "false"
         ],
         "qwen3-tts": [
-          "--tts_engine.engine.disable_cuda_graph",
-          "true"
-        ],
-        "qwen3-tts-cv": [
-          "--tts_engine.engine.disable_cuda_graph",
-          "true"
-        ],
-        "qwen3-tts-vd": [
           "--tts_engine.engine.disable_cuda_graph",
           "true"
         ]

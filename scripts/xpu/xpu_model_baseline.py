@@ -42,6 +42,7 @@ import json
 import math
 import os
 import re
+import shutil
 import socket
 import statistics
 import subprocess
@@ -791,6 +792,74 @@ def launch(model: XpuModel, cards: str, extra: tuple[str, ...] = ()) -> tuple[An
     return proc, f"http://127.0.0.1:{port}"
 
 
+def hub_cache_dir() -> str:
+    """The hub cache directory this host is using.
+
+    Walks up to a directory that exists, because HF_HOME may name a path whose leaves are
+    created on first use and the disk guard has to size against a real filesystem.
+    """
+    cache = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    while cache and not os.path.isdir(cache):
+        cache = os.path.dirname(cache)
+    return os.path.join(cache, "hub")
+
+
+def needed_checkpoints(model: XpuModel) -> list[str]:
+    """The model paths one measurement has to have locally, including its judge."""
+    paths = [model.model_path]
+    if model.judge:
+        paths.append(MODEL_BY_KEY[model.judge].model_path)
+    else:
+        pass
+    return paths
+
+
+def prune_hub_cache(model: XpuModel) -> str:
+    """Delete every cached revision this measurement does not need, and say what that freed.
+
+    Opt-in, because on some hosts the hub cache holds other people's work and deleting
+    what this run happens not to need is destructive. Through the hub's own API rather
+    than by removing directories: contents live in one content-addressed store that the
+    per-repo directories only link into, so removing a directory frees almost nothing.
+    """
+    from huggingface_hub import scan_cache_dir
+
+    keep = {path.partition("@")[0] for path in needed_checkpoints(model)}
+    before = shutil.disk_usage("/").free / 2**30
+    info = scan_cache_dir(hub_cache_dir())
+    doomed = [
+        revision.commit_hash
+        for repo in info.repos
+        if repo.repo_id not in keep
+        for revision in repo.revisions
+    ]
+    if doomed:
+        info.delete_revisions(*doomed).execute()
+    else:
+        pass
+    free_now = shutil.disk_usage("/").free / 2**30
+    return (
+        f"pruned {len(doomed)} revision(s), freed {free_now - before:.1f} GiB, "
+        f"{free_now:.1f} GiB free"
+    )
+
+
+def prefetch_checkpoints(model: XpuModel) -> str:
+    """Fetch this measurement's weights before the server starts.
+
+    Opt-in, for hosts whose server has no outbound network: the launcher strips proxy
+    variables from the server environment, so a checkpoint that is not already local never
+    arrives and the run fails as a startup timeout that names neither cause nor fix.
+    """
+    from huggingface_hub import snapshot_download
+
+    for path in needed_checkpoints(model):
+        repo, _, revision = path.partition("@")
+        snapshot_download(repo, revision=revision or None, max_workers=8)
+    free_now = shutil.disk_usage("/").free / 2**30
+    return f"fetched {len(needed_checkpoints(model))} checkpoint(s), {free_now:.1f} GiB free"
+
+
 def download_blocked(model_path: str) -> str:
     """Why this checkpoint cannot be fetched here, or an empty string if it can.
 
@@ -799,11 +868,8 @@ def download_blocked(model_path: str) -> str:
     which names neither the cause nor the fix. A cold checkpoint needs room, so say so
     before spending the half hour.
     """
-    cache = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    while cache and not os.path.isdir(cache):
-        cache = os.path.dirname(cache)
     repo, _, revision = model_path.partition("@")
-    blobs = os.path.join(cache, "hub", f"models--{repo.replace('/', '--')}", "blobs")
+    blobs = os.path.join(hub_cache_dir(), f"models--{repo.replace('/', '--')}", "blobs")
     # What this model has resident, which is not the size of its cache directory: blobs
     # are content-addressed in a store shared with every other repo and linked in from
     # here, so a complete checkpoint's own directory holds nothing but links. A link
@@ -836,7 +902,7 @@ def download_blocked(model_path: str) -> str:
         # through and let the launch report whatever actually goes wrong.
         print(f"  could not size {repo} before fetching it ({exc})")
         return ""
-    usage = os.statvfs(cache or "/")
+    usage = os.statvfs(hub_cache_dir() or "/")
     free_gib = usage.f_bavail * usage.f_frsize / 2**30
     # The repo total is an upper bound on what a load needs, not an estimate of it:
     # Whisper publishes the same weights as safetensors, bin and ONNX, and the loader
@@ -913,6 +979,7 @@ def measure_launches(
     extras: dict[str, tuple[str, ...]],
     launches: int,
     idle_mib: float,
+    idle_wait_s: int,
 ) -> dict:
     """Measure the model across whole server restarts, not just repeats inside one.
 
@@ -922,7 +989,9 @@ def measure_launches(
     for index in range(launches):
         if launches > 1:
             print(f"  launch {index + 1}/{launches}", flush=True)
-        runs.append(measure(model, pool, repeats, warmups, extras, idle_mib))
+        runs.append(
+            measure(model, pool, repeats, warmups, extras, idle_mib, idle_wait_s)
+        )
     if launches == 1:
         return runs[0]
     folded = fold_samples(runs)
@@ -968,18 +1037,31 @@ def measure(
     warmups: int,
     extras: dict[str, tuple[str, ...]],
     idle_mib: float = 1024.0,
+    idle_wait_s: int = 0,
 ) -> dict:
     """Serve the model, and its judge when it has one, then sample it warmups+repeats times."""
     servers = []
     taken: set[int] = set()
     cards = allocate_cards(pool, model.cards, taken)
     busy_before = cards_in_use(cards)
-    noisy = {card: mib for card, mib in busy_before.items() if mib > idle_mib}
-    if noisy:
-        raise CardsBusy(
-            f"card(s) not idle before launch: {noisy} MiB in use, over the {idle_mib:g} MiB "
-            "bar; another process on the card makes this a different machine"
-        )
+    deadline = time.time() + idle_wait_s
+    while True:
+        noisy = {card: mib for card, mib in busy_before.items() if mib > idle_mib}
+        if not noisy:
+            break
+        else:
+            pass
+        if time.time() >= deadline:
+            raise CardsBusy(
+                f"card(s) not idle before launch: {noisy} MiB in use, over the "
+                f"{idle_mib:g} MiB bar; another process on the card makes this a "
+                "different machine"
+            )
+        else:
+            pass
+        print(f"  waiting for {noisy} MiB to clear", flush=True)
+        time.sleep(30)
+        busy_before = cards_in_use(cards)
     try:
         judge_url = ""
         if model.judge:
@@ -1297,6 +1379,23 @@ def main() -> int:
         default=1024.0,
         help="refuse to measure a card already holding more than this; a neighbour's work reads as a regression otherwise",
     )
+    parser.add_argument(
+        "--idle-wait-s",
+        type=int,
+        default=0,
+        help="seconds to wait for a busy card before skipping the model",
+    )
+    parser.add_argument(
+        "--prune-hf-cache",
+        action="store_true",
+        help="delete cached checkpoints this measurement does not need; destructive, and "
+        "on some hosts the cache holds other users' work",
+    )
+    parser.add_argument(
+        "--prefetch",
+        action="store_true",
+        help="fetch weights before launching, for hosts whose server has no network",
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -1389,20 +1488,32 @@ def main() -> int:
 
     def flush(partial: dict[str, Any]) -> None:
         """Persist what is measured so far, so an interrupted sweep resumes instead of restarting."""
-        stored.setdefault("environments", {})[env_key] = {
+        on_disk = {"environments": {}}
+        if args.baseline.exists():
+            on_disk = json.loads(args.baseline.read_text())
+        else:
+            pass
+        previous = on_disk.get("environments", {}).get(env_key, {})
+        # Provenance belongs to the model it was measured with, so a model measured in this
+        # run carries what this run passed for it and nothing else. Merging globally meant a
+        # re-record without the workaround could not clear one, and the file went on
+        # claiming a flag the recorded number had not been measured with.
+        serve_extra = {
+            key: value
+            for key, value in previous.get("serve_extra", {}).items()
+            if key not in partial
+        }
+        serve_extra.update(
+            {key: list(value) for key, value in extras.items() if key in partial}
+        )
+        on_disk.setdefault("environments", {})[env_key] = {
             "fingerprint": fingerprint,
             "recorded_from_commit": recorded_from_commit(),
             "tolerances": tolerances,
-            # Merged like models: a later single-model record must not erase another
-            # model's recorded workaround, or the file claims it was measured with
-            # defaults that do not work.
-            "serve_extra": {
-                **entry.get("serve_extra", {}),
-                **{key: list(value) for key, value in extras.items()},
-            },
-            "models": {**entry.get("models", {}), **partial},
+            "serve_extra": serve_extra,
+            "models": {**previous.get("models", {}), **partial},
         }
-        args.baseline.write_text(json.dumps(stored, indent=2, sort_keys=True) + "\n")
+        args.baseline.write_text(json.dumps(on_disk, indent=2, sort_keys=True) + "\n")
 
     results: dict[str, Any] = {}
     failures: list[str] = []
@@ -1429,11 +1540,19 @@ def main() -> int:
             print(f"  SKIPPED: {reason}", flush=True)
             skipped.append(f"{key}: {reason}")
             continue
+        if args.prune_hf_cache:
+            print(f"  {prune_hub_cache(model)}", flush=True)
+        else:
+            pass
         shortfall = download_blocked(model.model_path)
         if shortfall:
             print(f"  SKIPPED: {shortfall}", flush=True)
             skipped.append(f"{key}: {shortfall}")
             continue
+        if args.prefetch:
+            print(f"  {prefetch_checkpoints(model)}", flush=True)
+        else:
+            pass
         try:
             observed = measure_launches(
                 model,
@@ -1443,6 +1562,7 @@ def main() -> int:
                 extras,
                 args.launches,
                 args.idle_mib,
+                args.idle_wait_s,
             )
         except CardsBusy as exc:
             print(f"  SKIPPED: {exc}", flush=True)
