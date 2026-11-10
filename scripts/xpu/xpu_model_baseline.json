@@ -495,6 +495,64 @@
             "speed.latency_s": 0.0128
           }
         },
+        "auk": {
+          "atmost": {
+            "round_trip_wer": 0.2222222222222222
+          },
+          "close": {
+            "peak": 0.891632080078125,
+            "rms": 0.17446345018337722
+          },
+          "exact": {
+            "frames": 96000.0,
+            "sample_rate": 24000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 5.42480787577893,
+            "latency_s": 0.737353302014526
+          },
+          "spread": {
+            "atmost.round_trip_wer": 0.0,
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0376,
+            "speed.latency_s": 0.0376
+          },
+          "within_run_spread": {
+            "speed.audio_seconds_per_wall_second": 0.0021,
+            "speed.latency_s": 0.0021
+          }
+        },
+        "auk-flash": {
+          "atmost": {
+            "round_trip_wer": 0.3333333333333333
+          },
+          "close": {
+            "peak": 0.96624755859375,
+            "rms": 0.21766000262183746
+          },
+          "exact": {
+            "frames": 96000.0,
+            "sample_rate": 24000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 18.075120745941483,
+            "latency_s": 0.22129865997703746
+          },
+          "spread": {
+            "atmost.round_trip_wer": 0.0,
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0108,
+            "speed.latency_s": 0.0108
+          },
+          "within_run_spread": {
+            "speed.audio_seconds_per_wall_second": 0.004,
+            "speed.latency_s": 0.004
+          }
+        },
         "dots-tts": {
           "atmost": {
             "round_trip_wer": 0.0
@@ -555,6 +613,34 @@
             "speed.latency_s": 0.03
           }
         },
+        "dots-tts-mf": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "close": {
+            "peak": 0.6400146484375,
+            "rms": 0.0889131741589094
+          },
+          "exact": {
+            "frames": 253440.0,
+            "sample_rate": 48000.0
+          },
+          "launches": 3,
+          "speed": {
+            "audio_seconds_per_wall_second": 2.2811330289617513,
+            "latency_s": 2.3146392310154624
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0022,
+            "speed.latency_s": 0.0022
+          },
+          "within_run_spread": {
+            "speed.audio_seconds_per_wall_second": 0.0085,
+            "speed.latency_s": 0.0085
+          }
+        },
         "fun-asr": {
           "atmost": {
             "word_error_rate": 0.0
@@ -569,6 +655,42 @@
           "spread": {
             "speed.audio_seconds_per_wall_second": 0.0099,
             "speed.latency_s": 0.01
+          }
+        },
+        "higgs": {
+          "atmost": {
+            "round_trip_wer": 0.0
+          },
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 85.5
+            },
+            "before": {
+              "0": 85.5
+            }
+          },
+          "close": {
+            "peak": 0.488250732421875,
+            "rms": 0.07625076943042634
+          },
+          "exact": {
+            "frames": 80640.0,
+            "sample_rate": 24000.0
+          },
+          "speed": {
+            "audio_seconds_per_wall_second": 4.279145660838874,
+            "latency_s": 0.785203464969527
+          },
+          "spread": {
+            "close.peak": 0.0,
+            "close.rms": 0.0,
+            "speed.audio_seconds_per_wall_second": 0.0125,
+            "speed.latency_s": 0.0126
+          },
+          "trimmed_spread": {
+            "speed.audio_seconds_per_wall_second": 0.0109,
+            "speed.latency_s": 0.011
           }
         },
         "moss-transcribe-diarize": {
@@ -729,6 +851,14 @@
       },
       "recorded_from_commit": "55d672a1",
       "serve_extra": {
+        "auk": [
+          "--auk_engine.factory.enable_dit_cuda_graph",
+          "false"
+        ],
+        "auk-flash": [
+          "--auk_engine.factory.enable_dit_cuda_graph",
+          "false"
+        ],
         "qwen3-tts": [
           "--tts_engine.engine.disable_cuda_graph",
           "true"

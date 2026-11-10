@@ -43,6 +43,8 @@ JUDGE_REPO = "Qwen/Qwen3-ASR-1.7B"
 # server warmup. Measured: with this flag the probe round-trips at WER 0.0000. Disabling the
 # vocoder's async_decode instead does NOT help; the stream belongs to the request builder.
 SERVE_EXTRA: dict[str, str] = {
+    "auk": "--auk_engine.factory.enable_dit_cuda_graph false",
+    "auk-flash": "--auk_engine.factory.enable_dit_cuda_graph false",
     "qwen3-tts": "--tts_engine.engine.disable_cuda_graph true",
     "qwen3-tts-cv": "--tts_engine.engine.disable_cuda_graph true",
     "qwen3-tts-vd": "--tts_engine.engine.disable_cuda_graph true",
@@ -66,22 +68,34 @@ PLAN: tuple[tuple[str, str, float, tuple[str, ...] | None], ...] = (
     ("auk", "tencent/AuK", 6.3, None),
     ("auk-flash", "tencent/AuK-Flash", 6.3, None),
     ("arkasr", "AutoArk-AI/ARK-ASR-3B", 7.6, None),
+    # Added 2026-11-10: the root disk went from 13 GB free to 20 GB, and these are the
+    # entries bmg17690 records that the old budget could not stage here.
+    (
+        "dots-tts-mf",
+        "dots-studio/dots.tts-mf@c28105adc8228143392b4e346994ff613ee48a06",
+        4.8,
+        None,
+    ),
+    ("higgs", "bosonai/higgs-audio-v3-tts-4b", 8.7, None),
+    ("minicpm-o", "openbmb/MiniCPM-o-4_5", 17.5, None),
 )
 
 # Recorded in the report rather than attempted: weights that this host's disk cannot hold
 # even alone, or a topology it does not have.
 SKIPPED_TOO_LARGE = {
-    "higgs": "8.7 GiB + 4.4 GiB judge exceeds the free disk",
-    "zonos2": "14.3 GiB of .pt weights exceeds the free disk",
-    "minicpm-o": "17.5 GiB exceeds the free disk",
     "ming-tts": "33.3 GiB exceeds the free disk",
     "minimax-music3": "53.4 GiB exceeds the free disk",
     "qwen3-omni-text": "65.7 GiB and needs 8 cards; this host has 4",
-    "ming-flash-omni": "220 GiB exceeds the free disk",
+    "ming-flash-omni": "222 GiB exceeds the free disk",
 }
+
 
 # Models whose probe also serves the judge for round-trip scoring.
 JUDGED = {
+    "dots-tts-mf",
+    "auk",
+    "auk-flash",
+    "higgs",
     "qwen3-tts",
     "qwen3-tts-cv",
     "qwen3-tts-vd",
@@ -93,8 +107,19 @@ JUDGED = {
 }
 
 
+def split_pin(repo: str) -> tuple[str, str | None]:
+    """Separate a revision-pinned model path into repo id and revision.
+
+    The table pins dots.tts-mf as "org/repo@sha" because its config pins that revision;
+    passing the whole string to the hub API asks for a repo that does not exist.
+    """
+    repo_id, _, revision = repo.partition("@")
+    return repo_id, revision or None
+
+
 def cache_dir(repo: str) -> Path:
-    return HF_HUB / ("models--" + repo.replace("/", "--"))
+    repo_id, _ = split_pin(repo)
+    return HF_HUB / ("models--" + repo_id.replace("/", "--"))
 
 
 def free_gib() -> float:
@@ -160,7 +185,10 @@ def prune_cache(keep: set[str]) -> float:
 def download(repo: str, patterns: tuple[str, ...] | None) -> None:
     from huggingface_hub import snapshot_download
 
-    snapshot_download(repo, max_workers=8, allow_patterns=patterns)
+    repo_id, revision = split_pin(repo)
+    snapshot_download(
+        repo_id, revision=revision, max_workers=8, allow_patterns=patterns
+    )
 
 
 def cards_in_use() -> list[float]:
