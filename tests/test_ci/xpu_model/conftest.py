@@ -63,6 +63,15 @@ def mirror_roots() -> list[Path]:
 
 
 def hub_cache_path(repo_id: str) -> str | None:
+    """A cached snapshot of ``repo_id``, or None.
+
+    A complete snapshot first, then a usable one. ``local_files_only`` wants
+    every file the repo publishes, which is stricter than serving: Whisper
+    ships its weights as safetensors, bin and ONNX, the loader takes one set,
+    and so a cache that serves it fine still reads as absent. That cost a model
+    its coverage in this lane while the same checkpoint was being served by
+    hand.
+    """
     try:
         from huggingface_hub import snapshot_download
     except ImportError:  # pragma: no cover - huggingface_hub is a core dep
@@ -70,7 +79,23 @@ def hub_cache_path(repo_id: str) -> str | None:
     try:
         return snapshot_download(repo_id=repo_id, local_files_only=True)
     except Exception as exc:
-        logger.debug(f"{repo_id} is not in the Hub cache: {exc}")
+        logger.debug(f"{repo_id} has no complete snapshot in the Hub cache: {exc}")
+
+    home = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
+    folder = "models--" + repo_id.replace("/", "--")
+    snapshots = Path(home) / "hub" / folder / "snapshots"
+    if not snapshots.is_dir():
+        return None
+    else:
+        usable = [
+            path
+            for path in sorted(snapshots.iterdir(), key=lambda p: p.name)
+            if holds_a_checkpoint(path)
+        ]
+    if usable:
+        logger.info(f"{repo_id}: partial cache at {usable[-1]} holds a checkpoint")
+        return str(usable[-1])
+    else:
         return None
 
 
@@ -80,6 +105,19 @@ def download(repo_id: str) -> str:
     return snapshot_download(repo_id=repo_id)
 
 
+def holds_a_checkpoint(path: Path) -> bool:
+    """Whether ``path`` looks like a checkpoint rather than just a directory.
+
+    A mirror collects empty directories -- an interrupted copy, or a name
+    reserved before the weights arrived. Four of them on one host were handed
+    straight to the server, which got as far as reading the architecture and
+    died with "Could not resolve model architecture", naming a path that did
+    exist. Checking the one file every family needs turns that into a look at
+    the next root.
+    """
+    return (path / "config.json").is_file()
+
+
 def resolve_checkpoint(model: XpuModel) -> str:
     """Env override, then a mirror root, then the Hub cache. Never downloads
     unless opted into, since an Omni pull is 66 GB."""
@@ -87,12 +125,27 @@ def resolve_checkpoint(model: XpuModel) -> str:
     if override:
         if not Path(override).exists():
             pytest.fail(f"{model.checkpoint_env}={override!r} does not exist")
-        return override
+        elif not holds_a_checkpoint(Path(override)):
+            # Named explicitly, so this is a mistake to report rather than
+            # something to look past.
+            pytest.fail(
+                f"{model.checkpoint_env}={override!r} has no config.json, so it "
+                "is not a checkpoint"
+            )
+        else:
+            return override
 
     for root in mirror_roots():
         candidate = root / model.mirror_dirname
-        if candidate.exists():
+        if not candidate.exists():
+            continue
+        elif holds_a_checkpoint(candidate):
             return str(candidate)
+        else:
+            logger.warning(
+                f"{candidate} has no config.json, so it is a placeholder rather "
+                "than a checkpoint; looking further"
+            )
 
     cached = hub_cache_path(model.repo_id)
     if cached is not None:

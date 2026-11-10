@@ -320,6 +320,7 @@ XPU_MODELS: tuple[XpuModel, ...] = (
         repo_id="tencent/AuK",
         cards=1,
         kind="speech_instructions",
+        startup_seconds=1800,
     ),
     XpuModel(
         key="auk-flash",
@@ -335,6 +336,7 @@ XPU_MODELS: tuple[XpuModel, ...] = (
         repo_id="tencent/AuK-Flash",
         cards=1,
         kind="speech_instructions",
+        startup_seconds=1800,
     ),
     XpuModel(
         key="minimax-music3",
@@ -355,6 +357,7 @@ XPU_MODELS: tuple[XpuModel, ...] = (
             "--minimax_music3_ar.engine.attention_backend",
             "triton",
         ),
+        startup_seconds=1800,
     ),
     XpuModel(
         key="omni-text",
