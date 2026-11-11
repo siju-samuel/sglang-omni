@@ -794,16 +794,21 @@ def launch(model: XpuModel, cards: str, extra: tuple[str, ...] = ()) -> tuple[An
     return proc, f"http://127.0.0.1:{port}"
 
 
-def hub_cache_dir() -> str:
-    """The hub cache directory this host is using.
+def existing_ancestor(path: str) -> str:
+    """The nearest ancestor of path that exists.
 
-    Walks up to a directory that exists, because HF_HOME may name a path whose leaves are
-    created on first use and the disk guard has to size against a real filesystem.
+    A cache directory's leaves are created on first use, so sizing the filesystem it will
+    live on has to ask about a directory that is already there.
     """
+    while path and not os.path.isdir(path):
+        path = os.path.dirname(path)
+    return path or "/"
+
+
+def hub_cache_dir() -> str:
+    """The hub cache directory this host is using, which need not exist yet."""
     cache = os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface")
-    while cache and not os.path.isdir(cache):
-        cache = os.path.dirname(cache)
-    return os.path.join(cache, "hub")
+    return os.path.join(existing_ancestor(cache), "hub")
 
 
 def needed_checkpoints(model: XpuModel) -> list[str]:
@@ -826,9 +831,14 @@ def prune_hub_cache(model: XpuModel) -> str:
     """
     from huggingface_hub import scan_cache_dir
 
+    cache = hub_cache_dir()
+    if not os.path.isdir(cache):
+        return "no hub cache to prune yet"
+    else:
+        pass
     keep = {path.partition("@")[0] for path in needed_checkpoints(model)}
     before = shutil.disk_usage("/").free / 2**30
-    info = scan_cache_dir(hub_cache_dir())
+    info = scan_cache_dir(cache)
     doomed = [
         revision.commit_hash
         for repo in info.repos
@@ -904,7 +914,7 @@ def download_blocked(model_path: str) -> str:
         # through and let the launch report whatever actually goes wrong.
         print(f"  could not size {repo} before fetching it ({exc})")
         return ""
-    usage = os.statvfs(hub_cache_dir() or "/")
+    usage = os.statvfs(existing_ancestor(hub_cache_dir()))
     free_gib = usage.f_bavail * usage.f_frsize / 2**30
     # The repo total is an upper bound on what a load needs, not an estimate of it:
     # Whisper publishes the same weights as safetensors, bin and ONNX, and the loader

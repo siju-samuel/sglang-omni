@@ -1,5 +1,51 @@
 {
   "environments": {
+    "48b255eda2d4": {
+      "fingerprint": {
+        "device": "Intel(R) Graphics [0x674c]",
+        "host": "cri19313",
+        "sglang": "0.5.24.dev7+g12e8df5e8",
+        "torch": "2.15.0a0+git39eb490"
+      },
+      "models": {
+        "minicpm-o": {
+          "atmost": {},
+          "cards": "0",
+          "cards_used_mib": {
+            "after": {
+              "0": 87.5
+            },
+            "before": {
+              "0": 87.5
+            }
+          },
+          "close": {},
+          "exact": {
+            "content": "42"
+          },
+          "speed": {
+            "decode_tokens_per_second": 45.24789693938849,
+            "latency_s": 0.06630142399808392
+          },
+          "spread": {
+            "speed.decode_tokens_per_second": 0.0076,
+            "speed.latency_s": 0.0076
+          },
+          "trimmed_spread": {
+            "speed.decode_tokens_per_second": 0.001,
+            "speed.latency_s": 0.001
+          }
+        }
+      },
+      "recorded_from_commit": "unknown",
+      "serve_extra": {},
+      "tolerances": {
+        "absolute": 0.05,
+        "close": 0.03,
+        "speed": 0.15,
+        "speed_headroom": 3.0
+      }
+    },
     "8c71267e0826": {
       "fingerprint": {
         "device": "Intel(R) Arc(TM) Pro B60 Graphics",
