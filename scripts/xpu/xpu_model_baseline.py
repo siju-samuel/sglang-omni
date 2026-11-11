@@ -492,10 +492,12 @@ def word_error_rate(reference: str, hypothesis: str) -> float:
     return previous[-1] / len(want)
 
 
-def environment_fingerprint() -> dict[str, str]:
+def environment_fingerprint(host_label: str = "") -> dict[str, str]:
     """Identify the machine a baseline belongs to, so numbers are never compared across hosts.
 
     Deliberately not the card pool: that is a run option, and keying on it forked the environment whenever a subset was measured with --card-pool. Which cards a model actually ran on is recorded with the model instead, and a later run on different cards says so.
+
+    host_label replaces the hostname for a run inside a container, where the hostname names the container rather than the machine. A cluster pod gets a fresh generated name per job, so without it every run records a brand new environment and nothing is ever compared. Pass the machine's stable identity, not the container's.
     """
     import torch
 
@@ -511,7 +513,7 @@ def environment_fingerprint() -> dict[str, str]:
         sglang_version = "unknown"
 
     return {
-        "host": socket.gethostname(),
+        "host": host_label or socket.gethostname(),
         "device": device,
         "torch": torch.__version__,
         "sglang": sglang_version,
@@ -1396,6 +1398,12 @@ def main() -> int:
         action="store_true",
         help="fetch weights before launching, for hosts whose server has no network",
     )
+    parser.add_argument(
+        "--host-label",
+        default="",
+        help="identify the machine as this instead of by hostname, for runs inside a "
+        "container whose hostname names the container and not the machine",
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -1439,7 +1447,7 @@ def main() -> int:
         extras[key] = tuple(argument_text.split())
 
     pool = [int(c) for c in args.card_pool.split(",") if c.strip()]
-    fingerprint = environment_fingerprint()
+    fingerprint = environment_fingerprint(args.host_label)
     env_key = fingerprint_key(fingerprint)
     print(f"environment {env_key}: {json.dumps(fingerprint)}")
 
