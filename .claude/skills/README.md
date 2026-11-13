@@ -18,6 +18,7 @@ is imported by `sglang_omni/`, and no CI job runs them.
 | Skill | What it does | Who can run it |
 |---|---|---|
 | [`running-eval-suite`](running-eval-suite/SKILL.md) | Reruns every reference benchmark under `benchmarks/eval/` and rewrites the reference-table cells in `benchmark_*.py` for the hardware it detects. Commits locally, never pushes. | Any sglang-omni dev container with free GPUs and the `omni` venv. |
+| [`device-agnostic-review`](device-agnostic-review/SKILL.md) | Reviews or rewrites a change so shared code reaches its device through `current_platform`, `torch.get_device_module` or `torch.accelerator` instead of naming CUDA. Its scanner lists the device-hardcoded lines a diff adds and marks the ones under a platform guard. | Anyone with the repo checked out; needs only `git` and Python 3, no GPU. |
 
 The evaluation skill expects the CI-equivalent environment (the `omni` venv,
 `HF_HOME` populated, `source .github/scripts/ci_env.sh`). Its precheck
