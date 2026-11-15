@@ -88,6 +88,11 @@ class XPUOmniPlatform(XpuDeviceMixin, OmniPlatform):
     def enable_talker_graph(self) -> bool:
         return True
 
+    def enable_thinker_prefill_graph(self) -> bool:
+        # Measured on 8x B60, Qwen3-Omni TP=8: a 22-token prompt's TTFT goes from 104
+        # to 41 ms; the request otherwise prefills eagerly, launch-bound.
+        return True
+
     def enable_tts_vocoder_fast_path(self) -> bool:
         return False
 

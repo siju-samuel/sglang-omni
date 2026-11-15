@@ -231,6 +231,10 @@ class OmniPlatform(DeviceMixin):
     def enable_thinker_decode_graph(self) -> bool:
         return True
 
+    def enable_thinker_prefill_graph(self) -> bool:
+        # Only CUDA has run the thinker's breakable prefill graph by default.
+        return self.is_cuda()
+
     def enable_zonos2_torch_compile(self) -> bool:
         return True
 

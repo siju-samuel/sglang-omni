@@ -222,6 +222,17 @@ def test_each_platform_names_the_graph_backend_its_hardware_uses() -> None:
             assert isinstance(backend, backend_class), platform_class.__name__
 
 
+def test_the_thinker_prefill_graph_is_on_for_cuda_and_xpu_only() -> None:
+    """XPU joins CUDA; every other platform keeps the eager prefill it had, since the
+    hook replaced an is_cuda() gate and must not widen it beyond XPU."""
+    assert CUDAOmniPlatform().enable_thinker_prefill_graph() is True
+    assert XPUOmniPlatform().enable_thinker_prefill_graph() is True
+    assert CPUOmniPlatform().enable_thinker_prefill_graph() is False
+    assert NPUOmniPlatform().enable_thinker_prefill_graph() is False
+    rocm = platforms.as_omni_platform(RocmSRTPlatform())
+    assert rocm.enable_thinker_prefill_graph() is False
+
+
 def test_npu_platform_opts_only_mimi_into_decode_graphs() -> None:
     platform = NPUOmniPlatform()
     assert platform.enable_mimi_decode_graph() is True

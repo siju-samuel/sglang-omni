@@ -1269,7 +1269,7 @@ def create_sglang_thinker_executor_from_config(
     # out). Note: mixed-chunk only engages when chunked_prefill_size > 0.
     from sglang_omni.platforms import current_platform
 
-    if current_platform.is_cuda():
+    if current_platform.enable_thinker_prefill_graph():
         prefill_graph_backend = CudaGraphBackend.BREAKABLE
     else:
         prefill_graph_backend = CudaGraphBackend.DISABLED
