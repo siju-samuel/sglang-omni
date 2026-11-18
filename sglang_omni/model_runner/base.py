@@ -161,6 +161,12 @@ class ModelRunner(Generic[RequestDataInput]):
     # note(YzXiao): opt in when next-round inputs are ready before CPU result collection and pending outputs retain their own storage.
     supports_speculative_async_decode: bool = False
 
+    # Where the platform cannot copy device-to-host without holding the host, take the
+    # lookahead ids as a device clone and copy them on a side stream. Opt-in: it took the
+    # TP=8 Qwen3-Omni thinker from 14.85 to 9.67 ms per step, but it costs Qwen3-ASR about
+    # 1 ms per step (168 -> 182 ms per request on a B60), so a runner has to measure it.
+    snapshot_launch_ids_on_side_stream: bool = False
+
     # True when the model's own speculative verify applies repetition_penalty exactly.
     speculative_verifies_repetition_penalty: bool = False
     # True when every verify row takes this runner's logits hooks, as its plain decode row would.
@@ -422,8 +428,11 @@ class ModelRunner(Generic[RequestDataInput]):
         self, ids: torch.Tensor, host_buf: torch.Tensor
     ) -> torch.Tensor:
         """Launch-time copy of ids for resolve: into host_buf, or a device clone where
-        that copy would hold the host until the launched forward finishes."""
-        if current_platform.supports_async_device_to_host_copy():
+        that copy would hold the host and the runner opts into the side stream."""
+        if (
+            current_platform.supports_async_device_to_host_copy()
+            or not self.snapshot_launch_ids_on_side_stream
+        ):
             host_buf[: ids.shape[0]].copy_(ids, non_blocking=True)
             return host_buf
         else:

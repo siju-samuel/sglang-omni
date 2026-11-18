@@ -477,6 +477,7 @@ def test_launch_ids_stay_on_device_where_the_host_copy_would_wait_for_the_forwar
         current_platform, "supports_async_device_to_host_copy", lambda: False
     )
     runner = make_runner([], custom_result=None)
+    runner.snapshot_launch_ids_on_side_stream = True
     ids = torch.tensor([7, 8])
     host_buf = torch.zeros(4, dtype=ids.dtype)
 
@@ -486,6 +487,26 @@ def test_launch_ids_stay_on_device_where_the_host_copy_would_wait_for_the_forwar
     assert launch_ids is not host_buf
     assert host_buf.tolist() == [0, 0, 0, 0]
     assert runner.host_launch_ids(launch_ids).tolist() == [7, 8]
+
+
+def test_a_runner_that_has_not_opted_in_keeps_the_host_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The side-stream snapshot is a per-runner measurement, not a platform default: it
+    made Qwen3-ASR about 1 ms per decode step slower on XPU while the thinker gained."""
+    from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+    from sglang_omni.platforms import current_platform
+
+    monkeypatch.setattr(
+        current_platform, "supports_async_device_to_host_copy", lambda: False
+    )
+    runner = make_runner([], custom_result=None)
+    ids = torch.tensor([7, 8])
+    host_buf = torch.zeros(4, dtype=ids.dtype)
+
+    assert runner.snapshot_launch_ids(ids, host_buf) is host_buf
+    assert host_buf[:2].tolist() == [7, 8]
+    assert ThinkerModelRunner.snapshot_launch_ids_on_side_stream is True
 
 
 @pytest.mark.accelerator
@@ -523,6 +544,7 @@ def test_resolve_hands_back_the_launched_step_after_waiting_for_its_copy(
         Event=SpyEvent, Stream=device_module.Stream, stream=device_module.stream
     )
     runner = make_runner([], custom_result=None)
+    runner.snapshot_launch_ids_on_side_stream = True
     runner.device = device
     runner.host_staging_buffers = []
     runner.staging_slot = 0

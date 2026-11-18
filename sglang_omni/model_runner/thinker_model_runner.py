@@ -30,6 +30,8 @@ logger = logging.getLogger(__name__)
 
 
 class ThinkerModelRunner(ModelRunner):
+    snapshot_launch_ids_on_side_stream = True
+
     def __init__(
         self,
         tp_worker: ModelWorker,
