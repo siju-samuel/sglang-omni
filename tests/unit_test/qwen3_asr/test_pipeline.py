@@ -1252,3 +1252,34 @@ def test_decode_only_override_retains_full_prefill_capacity(
     assert graph_config["prefill"]["full_prefill_max_req"] == prefill_override.get(
         "full_prefill_max_req", 32
     )
+
+
+@pytest.mark.parametrize(
+    ("is_xpu", "device", "expected"),
+    [(True, "xpu:0", "intel_xpu"), (True, "cpu", None), (False, "cuda:0", None)],
+)
+def test_qwen3_asr_defaults_to_intel_xpu_attention_on_an_xpu_stage(
+    monkeypatch: pytest.MonkeyPatch, is_xpu: bool, device: str, expected: str | None
+) -> None:
+    """Only a stage that runs on the XPU itself takes intel_xpu; a host-placed stage on
+    an XPU machine, and every other platform, keep the backend SGLang picks."""
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "current_platform",
+        SimpleNamespace(
+            is_xpu=lambda: is_xpu, is_cuda=lambda: False, is_rocm=lambda: False
+        ),
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "get_visible_gpu_sm_version",
+        lambda gpu_id: None,
+        raising=False,
+    )
+    builder = make_engine_builder()
+    builder.device = device
+    builder.gpu_id = 0
+
+    defaults = builder.generation_defaults(dtype="bfloat16")
+
+    assert defaults.get("attention_backend") == expected

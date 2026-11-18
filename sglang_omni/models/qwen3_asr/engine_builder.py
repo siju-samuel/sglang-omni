@@ -249,6 +249,16 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             defaults["prefill_attention_backend"] = "triton"
         else:
             pass
+        # Measured on a B60: 184 -> 165 ms per request with the transcript unchanged,
+        # prefill 21 -> 16 ms and each decode step about 1 ms faster than Triton.
+        if (
+            current_platform.is_xpu()
+            and self.device is not None
+            and str(self.device).split(":")[0] == "xpu"
+        ):
+            defaults["attention_backend"] = "intel_xpu"
+        else:
+            pass
         if self.mm_attention_backend is not None:
             defaults["mm_attention_backend"] = self.mm_attention_backend
         else:
